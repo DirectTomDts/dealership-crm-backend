@@ -140,4 +140,37 @@ app.get('/admin/users', requireAuth, requireAdmin, (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const INV_SHEET_ID = '1_R2mmi6O_KQW1mSd1Nu26fJDwrXKtRwH9vTwGnA2fN4';
+
+app.get('/inventory', requireAuth, async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: INV_SHEET_ID,
+      range: 'Sheet1',
+    });
+    const rows = response.data.values || [];
+    if (rows.length <= 1) return res.json([]);
+    const inventory = rows.slice(1).map(r => ({
+      unit:       r[0]  || '',
+      year:       r[1]  || '',
+      make:       r[2]  || '',
+      model:      r[3]  || '',
+      hours:      r[4]  || '',
+      miles:      r[5]  || '',
+      apu:        r[6]  || '',
+      color:      r[7]  || '',
+      ratio:      r[8]  || '',
+      hp:         r[9]  || '',
+      listPrice:  r[10] || '',
+      salePrice:  r[11] || '',
+      status:     r[12] || '',
+      origPrice:  r[13] || '',
+    }));
+    res.json(inventory);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load inventory' });
+  }
+});
 app.listen(PORT, () => console.log(`Dealer CRM server running on port ${PORT}`));
