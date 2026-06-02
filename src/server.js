@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { google } = require('googleapis');
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -165,7 +167,7 @@ app.get('/inventory', requireAuth, async (req, res) => {
       listPrice:  r[10] || '',
       salePrice:  r[11] || '',
       status:     r[12] || '',
-      origPrice:  r[13] || '',
+      vin:        r[13] || '',   // <-- was origPrice, now VIN
     }));
     res.json(inventory);
   } catch (e) {
@@ -173,4 +175,139 @@ app.get('/inventory', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to load inventory' });
   }
 });
+// Generate test drive PDF
+app.post('/testdrive/generate', requireAuth, async (req, res) => {
+  try {
+    const d = req.body;
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([612, 792]);
+    const { width, height } = page.getSize();
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
+    const margin = 50;
+    let y = height - 50;
+
+    function drawText(text, x, yPos, opts = {}) {
+      page.drawText(String(text || ''), { x, y: yPos, size: opts.size || 10, font: opts.bold ? fontBold : (opts.italic ? fontItalic : font), color: rgb(0,0,0), maxWidth: opts.maxWidth });
+    }
+    function line(yPos, x1 = margin, x2 = width - margin) {
+      page.drawLine({ start:{x:x1,y:yPos}, end:{x:x2,y:yPos}, thickness:0.5, color:rgb(0.4,0.4,0.4) });
+    }
+
+    // Header
+    drawText('TEST DRIVE AGREEMENT', margin, y, { bold:true, size:16 });
+    y -= 24; line(y); y -= 16;
+    drawText('The undersigned hereby acknowledges receiving the following described vehicle for test drive purposes:', margin, y, { size:9, italic:true });
+    y -= 20;
+
+    // Vehicle box
+    page.drawRectangle({ x:margin, y:y-4, width:width-margin*2, height:44, color:rgb(0.95,0.95,0.95), borderColor:rgb(0.8,0.8,0.8), borderWidth:0.5 });
+    drawText('Make:', margin+8, y+24, {bold:true,size:9}); drawText(d.make||'', margin+42, y+24, {size:9});
+    drawText('Year:', margin+140, y+24, {bold:true,size:9}); drawText(d.year||'', margin+168, y+24, {size:9});
+    drawText('Model:', margin+220, y+24, {bold:true,size:9}); drawText(d.model||'', margin+256, y+24, {size:9});
+    drawText('VIN / Serial #:', margin+8, y+8, {bold:true,size:9}); drawText(d.vin||'', margin+82, y+8, {size:9});
+    drawText('Stock #:', margin+280, y+8, {bold:true,size:9}); drawText(d.unit||'', margin+322, y+8, {size:9});
+    drawText('Plate #:', margin+380, y+8, {bold:true,size:9}); drawText(d.plate||'', margin+422, y+8, {size:9});
+    y -= 56;
+
+    // Dealership + date
+    drawText('From:', margin, y, {bold:true,size:9}); drawText('Direct Truck Sales Inc. — 15w740 N. Frontage Rd, Burr Ridge, Illinois', margin+34, y, {size:9});
+    y -= 16;
+    drawText('Date:', margin, y, {bold:true,size:9}); drawText(d.date||'', margin+34, y, {size:9});
+    drawText('Return by:', margin+180, y, {bold:true,size:9}); drawText(d.returnTime||'', margin+240, y, {size:9});
+    y -= 20; line(y); y -= 14;
+
+    // Conditions
+    drawText('CONDITIONS & REPRESENTATIONS:', margin, y, {bold:true,size:9}); y -= 14;
+    const conditions = [
+      'Vehicle shall be returned within 3 hours or on dealer\'s demand, free of liens, in the same mechanical and physical condition as received, or undersigned shall pay for all repairs necessary.',
+      'Undersigned shall pay dealer immediately the full present retail value of the vehicle if it is not returned for any reason whatsoever.',
+      'Vehicle is to be driven exclusively by the undersigned for test drive purposes only and shall not be used for transportation of persons or property for hire.',
+      'Vehicle shall not be operated in violation of any law (Federal, State, or local), nor driven beyond a radius of 25 miles from dealer\'s place of business.',
+      'Vehicle will be preserved and protected from all loss, damage, or injury. Undersigned agrees to indemnify and hold harmless the dealer. Unit is GPS monitored and shall not be modified or altered in any way.',
+    ];
+    conditions.forEach(c => {
+      page.drawText('\u2022  ' + c, { x:margin+10, y, size:8.5, font, color:rgb(0,0,0), maxWidth:width-margin*2-20, lineHeight:13 });
+      y -= (Math.ceil(c.length/95) * 13) + 6;
+    });
+
+    y -= 4; line(y); y -= 14;
+    drawText('DYNO Testing NOT allowed', margin, y, {bold:true,size:9}); drawText('Initials: _________', margin+280, y, {size:9});
+    y -= 14;
+    drawText('Calibration, programming, and Parked Forced Regeneration NOT allowed', margin, y, {italic:true,size:9}); drawText('Initials: _________', margin+280, y, {size:9});
+    y -= 16; line(y); y -= 14;
+
+    // DL paragraph
+    const dlText = `The undersigned represents that he/she is duly and legally licensed to operate a vehicle in the State of Illinois under license number [${d.dlNumber||'________________'}] State [${d.dlState||'IL'}] and that he/she has no physical conditions that could cause him/her to be unfit to drive said vehicle. If dealer's vehicle is operated beyond the time specified for its return, the undersigned does so without permission of dealer.`;
+    page.drawText(dlText, {x:margin, y, size:8.5, font, color:rgb(0,0,0), maxWidth:width-margin*2, lineHeight:13});
+    y -= 56; line(y); y -= 14;
+
+    // Signature block
+    const colMid = margin + (width-margin*2)/2;
+    drawText('SALESPERSON:', margin, y, {bold:true,size:9}); drawText(d.salesperson||'', margin+80, y, {size:9});
+    y -= 16;
+    drawText('DATE:', margin, y, {bold:true,size:9}); drawText(d.date||'', margin+40, y, {size:9});
+    y -= 16;
+    drawText('DRIVER LICENSE #:', margin, y, {bold:true,size:9}); drawText((d.dlNumber||'')+'  ('+( d.dlState||'IL')+')', margin+105, y, {size:9});
+    y += 32;
+    drawText('CUSTOMER SIGNATURE:', colMid+10, y, {bold:true,size:9}); line(y-2, colMid+135, width-margin);
+    y -= 16;
+    drawText('ADDRESS:', colMid+10, y, {bold:true,size:9}); drawText(`${d.address||''}, ${d.city||''}, ${d.state||''} ${d.zip||''}`, colMid+70, y, {size:9});
+    y -= 16;
+    drawText('CUSTOMER NAME:', colMid+10, y, {bold:true,size:9}); drawText(d.customerName||'', colMid+105, y, {size:9});
+    y -= 20; line(y); y -= 10;
+    drawText('Direct Truck Sales Inc. — 15w740 N. Frontage Rd, Burr Ridge, IL — Test Drive Agreement', margin, y, {size:7.5, italic:true});
+
+    const pdfBytes = await pdfDoc.save();
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="TestDrive_${(d.customerName||'Agreement').replace(/\s+/g,'_')}_${d.date||''}.pdf"`});
+    res.send(Buffer.from(pdfBytes));
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({ error: 'PDF generation failed: ' + e.message });
+  }
+});
+
+// Save test drive record
+app.post('/testdrive/save', requireAuth, async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const d = req.body;
+    const TD_SHEET = 'TestDrives';
+    // Ensure header exists
+    try { await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TD_SHEET}!A1` }); }
+    catch {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: `${TD_SHEET}!A1`, valueInputOption: 'RAW',
+        requestBody: { values: [['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] }
+      });
+    }
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: TD_SHEET,
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [[ d.date, d.customerName, d.phone, d.address, d.city, d.state, d.zip, d.dlNumber, d.dlState, d.unit, d.make, d.model, d.vin, d.plate, d.returnTime, d.salesperson, d.leadId||'' ]] }
+    });
+    res.json({ success: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Failed to save record' }); }
+});
+
+// Get test drive history
+app.get('/testdrive/history', requireAuth, async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'TestDrives' });
+    const rows = response.data.values || [];
+    if (rows.length <= 1) return res.json([]);
+    const records = rows.slice(1).map(r => ({
+      date: r[0]||'', customerName: r[1]||'', phone: r[2]||'',
+      address: r[3]||'', city: r[4]||'', state: r[5]||'', zip: r[6]||'',
+      dlNumber: r[7]||'', dlState: r[8]||'', unit: r[9]||'',
+      make: r[10]||'', model: r[11]||'', vin: r[12]||'',
+      plate: r[13]||'', returnTime: r[14]||'', salesperson: r[15]||'', leadId: r[16]||''
+    })).reverse();
+    res.json(records);
+  } catch(e) { res.status(500).json({ error: 'Failed to load history' }); }
+});
+
+
 app.listen(PORT, () => console.log(`Dealer CRM server running on port ${PORT}`));
