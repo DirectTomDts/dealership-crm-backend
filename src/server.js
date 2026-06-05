@@ -284,234 +284,221 @@ app.get('/testdrive/history', requireAuth, async (req, res) => {
 app.post('/billsofsale/generate', requireAuth, async (req, res) => {
   try {
     const d = req.body;
+    const units = d.units && d.units.length > 0 ? d.units
+      : [{num:1,unit:d.unit,year:d.year,make:d.make,model:d.model,vin:d.vin,miles:d.miles,
+          apu:d.apu,color:d.color,ratio:d.ratio,hp:d.hp,warrantyCoverage:d.warrantyCoverage,
+          serviceContractLevel:d.serviceContractLevel,serviceContractCoverage:d.serviceContractCoverage,
+          serviceContractPrice:d.serviceContractPrice,salePrice:d.salePrice,salesTax:d.salesTax,
+          titleFee:d.titleFee,docFee:d.docFee,item1:d.item1,item2:d.item2,item3:d.item3,item4:d.item4}];
+
     const pdfDoc = await PDFDocument.create();
-    const fontBold   = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    const font       = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const W = 612, H = 792, M = 44;
-    const makePage = () => pdfDoc.addPage([W, H]);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const font     = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const W=612, H=792, M=44;
 
-    // Helper: draw text safely
-    const dt = (pg, text, x, yPos, opts={}) => {
-      try { pg.drawText(String(text||''), { x, y:yPos, size:opts.size||9, font:opts.bold?fontBold:font, color:rgb(...(opts.color||[0,0,0])), maxWidth:opts.maxWidth||(W-M-x) }); } catch(e){}
+    const dt = (pg,text,x,yPos,opts={}) => {
+      try{ pg.drawText(String(text||''),{x,y:yPos,size:opts.size||9,font:opts.bold?fontBold:font,color:rgb(...(opts.color||[0,0,0])),maxWidth:opts.maxWidth||(W-M-x)}); }catch(e){}
     };
-    const ln = (pg, yPos, x1=M, x2=W-M, t=0.5) => {
-      pg.drawLine({start:{x:x1,y:yPos},end:{x:x2,y:yPos},thickness:t,color:rgb(0.75,0.75,0.75)});
-    };
-    const box = (pg, x, y, w, h, fill=[0.95,0.95,0.95]) => {
-      pg.drawRectangle({x,y,width:w,height:h,color:rgb(...fill),borderColor:rgb(0.82,0.82,0.82),borderWidth:0.5});
-    };
-    const fmtMoney = v => {
-      const n = parseFloat(String(v||'0').replace(/[$,]/g,''));
-      return (!v||isNaN(n)||n===0) ? '' : '$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-    };
-    const addLogo = async (pg, x, y) => {
-      try {
+    const ln = (pg,yPos,x1=M,x2=W-M,t=0.5) => pg.drawLine({start:{x:x1,y:yPos},end:{x:x2,y:yPos},thickness:t,color:rgb(0.75,0.75,0.75)});
+    const box = (pg,x,y,w,h,fill=[0.95,0.95,0.95]) => pg.drawRectangle({x,y,width:w,height:h,color:rgb(...fill),borderColor:rgb(0.82,0.82,0.82),borderWidth:0.5});
+    const fmtM = v => { const n=parseFloat(String(v||'0').replace(/[$,]/g,'')); return (!v||isNaN(n)||n===0)?null:'$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+
+    // Header block — same layout on every page
+    const addHeader = async (pg, title) => {
+      let y = H-36;
+      // Logo left
+      try{
         const img = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
-        const dims = img.scaleToFit(140,52);
-        pg.drawImage(img,{x,y:y-dims.height+8,width:dims.width,height:dims.height});
-      } catch(e){}
+        const dims = img.scaleToFit(130,46);
+        pg.drawImage(img,{x:M,y:y-dims.height+8,width:dims.width,height:dims.height});
+      }catch(e){}
+      // Company info RIGHT-ALIGNED block
+      const infoX = W-M-165;
+      dt(pg,'Direct Truck Sales Inc.',infoX,y,{bold:true,size:9});
+      dt(pg,'15w740 N. Frontage Rd, Ste 2',infoX,y-12,{size:8});
+      dt(pg,'Burr Ridge, IL 60527',infoX,y-23,{size:8});
+      dt(pg,'630-701-1000',infoX,y-34,{size:8});
+      dt(pg,'Sales@Direct-Truck.com',infoX,y-45,{size:8,color:[0,0.3,0.7]});
+      dt(pg,'Finance@Direct-Truck.com',infoX,y-56,{size:8,color:[0,0.3,0.7]});
+      y -= 68;
+      // Title bar
+      pg.drawRectangle({x:M,y:y-14,width:W-M*2,height:20,color:rgb(0.12,0.12,0.12)});
+      dt(pg,title,W/2-40,y-8,{bold:true,size:12,color:[1,1,1]});
+      dt(pg,'Date: '+(d.date||''),W-M-104,y-8,{size:8.5,color:[0.9,0.9,0.9]});
+      return y-28;
     };
 
-    // ── PAGE 1 — BILL OF SALE ────────────────────────────────────────────────
-    const p1 = makePage();
-    let y = H - 38;
+    // ── PAGE 1: PURCHASER + UNIT 1 ────────────────────────────────────────────
+    const p1 = pdfDoc.addPage([W,H]);
+    let y = await addHeader(p1,'BILL OF SALE');
 
-    // Header: logo left, address right
-    await addLogo(p1, M, y);
-    const addrX = W - M - 170;
-    dt(p1,'Direct Truck Sales Inc.',addrX,y,{bold:true,size:9});
-    dt(p1,'15w740 N. Frontage Rd, Ste 2',addrX,y-12,{size:8});
-    dt(p1,'Burr Ridge, IL 60527',addrX,y-23,{size:8});
-    dt(p1,'630-701-1000',addrX,y-34,{size:8});
-    dt(p1,'Sales@Direct-Truck.com',addrX,y-45,{size:8,color:[0,0.3,0.7]});
-    y -= 62;
+    // Purchaser box
+    const LBL=86, VAL=W/2-M-LBL-8;
+    box(p1,M,y-96,W-M*2,108);
+    dt(p1,'PURCHASER',M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+    dt(p1,'Sales Rep: '+(d.salesperson||''),W-M-150,y-5,{size:8});
+    y-=18;
+    // 2-column info table
+    const col1=M+6, col2=W/2+6;
+    const row=(pg,yp,l1,v1,l2,v2)=>{
+      dt(pg,l1,col1,yp,{bold:true,size:8.5}); dt(pg,v1||'',col1+LBL,yp,{size:8.5,maxWidth:VAL});
+      if(l2){dt(pg,l2,col2,yp,{bold:true,size:8.5}); dt(pg,v2||'',col2+LBL,yp,{size:8.5,maxWidth:VAL});}
+    };
+    row(p1,y,'Name:',d.personalName,'Business:',d.businessName); y-=13;
+    row(p1,y,'Address:',d.address,'Address:',(d.bizAddress||d.address)); y-=13;
+    const csz=`${d.city||''}, ${d.state||''} ${d.zip||''}`;
+    const bcsz=d.bizCity?`${d.bizCity}, ${d.bizState||''} ${d.bizZip||''}`:csz;
+    row(p1,y,'City/St/ZIP:',csz,'City/St/ZIP:',bcsz); y-=13;
+    row(p1,y,'Phone:',d.phone,'Phone:',(d.bizPhone||d.phone)); y-=13;
+    row(p1,y,'Email:',d.email,'DL # / State:',`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`); y-=18;
 
-    // Title bar
-    p1.drawRectangle({x:M,y:y-14,width:W-M*2,height:20,color:rgb(0.12,0.12,0.12)});
-    dt(p1,'BILL OF SALE',W/2-30,y-8,{bold:true,size:12,color:[1,1,1]});
-    dt(p1,'Date: '+(d.date||''),W-M-100,y-8,{size:8.5,color:[0.9,0.9,0.9]});
-    y -= 28;
+    // Units loop — each unit gets its own section box
+    for(let ui=0;ui<units.length;ui++){
+      const u=units[ui];
+      const hasItems=[u.item1,u.item2,u.item3,u.item4].filter(Boolean).length>0;
+      // Check if we need a new page
+      if(y < 280){ const np=pdfDoc.addPage([W,H]); y=await addHeader(np,`BILL OF SALE — Unit ${ui+1} (cont.)`); }
 
-    // ── PURCHASER INFO — 2 column table ──────────────────────────────────────
-    box(p1,M,y-102,W-M*2,114);
-    const col1=M+6, col2=W/2+6, LW=90, VW=180;
-
-    // Section headers
-    dt(p1,'PURCHASER INFORMATION',col1,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
-    dt(p1,'Sales Rep: '+(d.salesperson||''),W-M-130,y-5,{size:8});
-    y -= 18;
-
-    // Row 1
-    dt(p1,'Name:',col1,y,{bold:true,size:8.5}); dt(p1,d.personalName||'',col1+LW,y,{size:8.5,maxWidth:VW});
-    dt(p1,'Business:',col2,y,{bold:true,size:8.5}); dt(p1,d.businessName||'',col2+LW,y,{size:8.5,maxWidth:VW});
-    y -= 13;
-    // Row 2
-    dt(p1,'Address:',col1,y,{bold:true,size:8.5}); dt(p1,d.address||'',col1+LW,y,{size:8.5,maxWidth:VW});
-    dt(p1,'Address:',col2,y,{bold:true,size:8.5}); dt(p1,d.bizAddress||'',col2+LW,y,{size:8.5,maxWidth:VW});
-    y -= 13;
-    // Row 3
-    const csz = [d.city,d.state,d.zip].filter(Boolean).join(', ');
-    const bcsz = [d.bizCity,d.bizState,d.bizZip].filter(Boolean).join(', ');
-    dt(p1,'City/St/ZIP:',col1,y,{bold:true,size:8.5}); dt(p1,csz,col1+LW,y,{size:8.5,maxWidth:VW});
-    dt(p1,'City/St/ZIP:',col2,y,{bold:true,size:8.5}); dt(p1,bcsz,col2+LW,y,{size:8.5,maxWidth:VW});
-    y -= 13;
-    // Row 4
-    dt(p1,'Phone:',col1,y,{bold:true,size:8.5}); dt(p1,d.phone||'',col1+LW,y,{size:8.5,maxWidth:VW});
-    dt(p1,'Phone:',col2,y,{bold:true,size:8.5}); dt(p1,d.bizPhone||'',col2+LW,y,{size:8.5,maxWidth:VW});
-    y -= 13;
-    // Row 5
-    dt(p1,'Email:',col1,y,{bold:true,size:8.5}); dt(p1,d.email||'',col1+LW,y,{size:8.5,maxWidth:VW});
-    dt(p1,'DL # / State:',col2,y,{bold:true,size:8.5}); dt(p1,`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`,col2+LW,y,{size:8.5,maxWidth:VW});
-    y -= 18;
-
-    // ── VEHICLE(S) ────────────────────────────────────────────────────────────
-    const units = d.units && d.units.length > 0 ? d.units : [{unit:d.unit,year:d.year,make:d.make,model:d.model,vin:d.vin,miles:d.miles,apu:d.apu,color:d.color,ratio:d.ratio,hp:d.hp}];
-    const vBoxH = units.length * 28 + 20;
-    box(p1,M,y-vBoxH,W-M*2,vBoxH+12);
-    dt(p1,units.length>1?`VEHICLES (${units.length})`:'VEHICLE',col1,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
-    y -= 16;
-    units.forEach((u,ui) => {
-      if(ui>0) { ln(p1,y+4,M+4,W-M-4,0.3); y-=2; }
-      if(units.length>1) dt(p1,`Unit ${ui+1}:`,M+6,y,{bold:true,size:8,color:[0.3,0.3,0.3]});
-      const vcStarts=units.length>1?[M+50,M+115,M+210,M+310,M+445]:[M+6,M+80,M+175,M+285,M+440];
-      const vcLW=units.length>1?[34,34,34,28,36]:[36,36,36,30,38];
-      [{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit #:',v:u.unit||''}].forEach((f,i)=>{
-        dt(p1,f.l,vcStarts[i],y,{bold:true,size:7.5});
-        dt(p1,f.v,vcStarts[i]+vcLW[i],y,{size:8.5,maxWidth:i===3?120:85});
+      // Vehicle box
+      const vBoxH = 70;
+      box(p1,M,y-vBoxH,W-M*2,vBoxH+12);
+      dt(p1,units.length>1?`VEHICLE — UNIT ${ui+1}`:' VEHICLE',M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+      y-=16;
+      // Row 1: Year Make Model VIN Unit#
+      const vc=[{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit #:',v:u.unit||''}];
+      const vcX=[M+6,M+76,M+168,M+272,M+440]; const vcW=[32,34,32,28,36];
+      vc.forEach((f,i)=>{ dt(p1,f.l,vcX[i],y,{bold:true,size:7.5}); dt(p1,f.v,vcX[i]+vcW[i],y,{size:8.5,maxWidth:i===3?155:85}); });
+      y-=14;
+      // Row 2: options
+      let ox=M+6;
+      [['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]].forEach(([k,v])=>{
+        if(v){dt(p1,k+':',ox,y,{bold:true,size:7.5}); dt(p1,String(v),ox+34,y,{size:8,maxWidth:65}); ox+=100;}
       });
-      y -= 13;
-      const optPairs=[['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]];
-      let optX=M+6; optPairs.forEach(([k,v])=>{if(v){dt(p1,k+':',optX,y,{bold:true,size:7.5}); dt(p1,String(v),optX+34,y,{size:8,maxWidth:65}); optX+=100;}});
-      y -= 14;
-    });
-    // Warranty + Service contract on same row
-    dt(p1,'Warranty:',col1,y,{bold:true,size:8.5}); dt(p1,d.warrantyCoverage||'AS-IS',col1+58,y,{size:8.5,maxWidth:155});
-    if(d.serviceContractLevel){
-      dt(p1,'Service Contract:',col2,y,{bold:true,size:8.5});
-      dt(p1,`${d.serviceContractLevel} — ${d.serviceContractCoverage||''}`,col2+105,y,{size:8.5,maxWidth:155});
-    }
-    y -= 20;
-
-    // ── FINANCIAL SUMMARY — right column ─────────────────────────────────────
-    const finX = W/2+10, finW = W-M-finX;
-    box(p1,finX-6,y-174,finW+10,186);
-    dt(p1,'FINANCIAL SUMMARY',finX,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
-    y -= 18;
-
-    // Financial summary — fixed label column + right-aligned value column
-    const labelCol = finX + 4;
-    const valueCol = W - M - 4;
-    const finRows = [
-      ['Sales Price:',      fmtMoney(d.salePrice)],
-      ['Service Contract:', d.serviceContractPrice && parseFloat(d.serviceContractPrice)>0 ? fmtMoney(d.serviceContractPrice) : null],
-      ['Sales Tax:',        d.salesTax && parseFloat(d.salesTax)>0 ? fmtMoney(d.salesTax) : null],
-      ['IL Title Fee:',     d.titleFee && parseFloat(d.titleFee)>0 ? fmtMoney(d.titleFee) : null],
-      ['Doc Fee:',          fmtMoney(d.docFee||350)],
-      ['Deposit:',          d.depositAmount && parseFloat(d.depositAmount)>0 ? `- ${fmtMoney(d.depositAmount)}` : null],
-    ];
-    finRows.forEach(([label,val])=>{
-      if(!val) return;
-      dt(p1,label,labelCol,y,{bold:true,size:8.5,maxWidth:90});
-      // Right-align value
-      const valW = val.length * 5.5;
-      dt(p1,val,valueCol-valW,y,{size:8.5,maxWidth:90});
-      p1.drawLine({start:{x:finX,y:y-3},end:{x:W-M,y:y-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
-      if(label==='Deposit:') { // add deposit type below if present
-        if(d.depositType){ dt(p1,'('+d.depositType+')',labelCol+52,y-11,{size:7.5,color:[0.5,0.5,0.5],maxWidth:80}); y-=11; }
+      y-=14;
+      // Warranty + SC
+      dt(p1,'Warranty:',M+6,y,{bold:true,size:8.5}); dt(p1,u.warrantyCoverage||'AS-IS',M+58,y,{size:8.5,maxWidth:150});
+      if(u.serviceContractLevel){
+        dt(p1,'Service Contract:',W/2+6,y,{bold:true,size:8.5});
+        dt(p1,`${u.serviceContractLevel} — ${u.serviceContractCoverage||''}`,W/2+106,y,{size:8.5,maxWidth:155});
       }
-      y-=15;
-    });
-    y-=4; p1.drawLine({start:{x:finX,y},end:{x:W-M,y},thickness:1.5,color:rgb(0.2,0.2,0.2)}); y-=15;
-    dt(p1,'TOTAL:',labelCol,y,{bold:true,size:11});
-    const totalVal = fmtMoney(d.total);
-    const tvW = (totalVal||'').length * 6.8;
-    dt(p1,totalVal||'',valueCol-tvW,y,{bold:true,size:13,color:[0.05,0.42,0.1]});
+      y-=20;
 
-    // ── TERMS ─────────────────────────────────────────────────────────────────
-    y = 200;
-    ln(p1,y+14);
-    dt(p1,'Terms and Conditions',M,y+4,{bold:true,size:8.5});
-    p1.drawText('Purchaser agrees this Purchase Order with any attachments includes all terms as of the Date Accepted, comprising the complete and exclusive agreement. This Invoice cancels and supersedes any prior agreement between Direct Truck Sales and Purchaser, and is binding only when accepted by both parties below.',
+      // Financial summary for this unit — right-side box
+      const finX=W/2+10, finW=W-M-finX;
+      const finItems=[
+        ['Sale Price:',    fmtM(u.salePrice)],
+        ['Service Contr.:',u.serviceContractPrice&&parseFloat(u.serviceContractPrice)>0?fmtM(u.serviceContractPrice):null],
+        ['Sales Tax:',     u.salesTax&&parseFloat(u.salesTax)>0?fmtM(u.salesTax):null],
+        ['IL Title Fee:',  u.titleFee&&parseFloat(u.titleFee)>0?fmtM(u.titleFee):null],
+        ['Doc Fee:',       fmtM(u.docFee||350)],
+      ].filter(r=>r[1]);
+      const finH = finItems.length*15+30;
+      box(p1,finX-6,y-finH,finW+10,finH+12);
+      dt(p1,units.length>1?`FINANCIALS — UNIT ${ui+1}`:'FINANCIAL SUMMARY',finX,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+      let fy=y-18;
+      finItems.forEach(([lbl,val])=>{
+        dt(p1,lbl,finX+2,fy,{bold:true,size:8.5,maxWidth:90});
+        const vw=(val||'').length*5.4; dt(p1,val||'',W-M-4-vw,fy,{size:8.5,maxWidth:90});
+        p1.drawLine({start:{x:finX,y:fy-3},end:{x:W-M,y:fy-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
+        fy-=15;
+      });
+      y-=finH+16;
+    }
+
+    // Deposit + Grand total
+    if(d.depositAmount && parseFloat(d.depositAmount)>0){
+      ln(p1,y+8,W/2+4,W-M); y-=12;
+      dt(p1,'Deposit:',W/2+10,y,{bold:true,size:9}); dt(p1,`- ${fmtM(d.depositAmount)||''} (${d.depositType||''})`,W/2+70,y,{size:9,maxWidth:155});
+      y-=14;
+    }
+    ln(p1,y+8,W/2+4,W-M,1.5);
+    y-=16;
+    dt(p1,'GRAND TOTAL:',W/2+10,y,{bold:true,size:12});
+    const tvw=(fmtM(d.total)||'').length*6.5;
+    dt(p1,fmtM(d.total)||'',W-M-4-tvw,y,{bold:true,size:13,color:[0.05,0.42,0.1]});
+    y-=24;
+
+    // Terms
+    y=Math.min(y,200);
+    ln(p1,y+14); dt(p1,'Accepted Terms and Conditions',M,y+4,{bold:true,size:8.5});
+    p1.drawText('Purchaser agrees this Purchase Order includes all terms as of the Date Accepted. This Invoice cancels and supersedes any prior agreement and is binding when accepted by both parties.',
       {x:M,y:y-12,size:7.5,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:11});
-    y -= 44;
-    dt(p1,'Purchaser declines additional warranty on the above vehicle',M,y,{bold:true,size:8});
-    dt(p1,'Initials: _________',W-M-105,y,{size:8});
-    y -= 24; ln(p1,y+8);
+    y-=38;
+    dt(p1,'Purchaser declines additional warranty',M,y,{bold:true,size:8}); dt(p1,'Initials: _________',W-M-105,y,{size:8});
+    y-=22; ln(p1,y+8);
     dt(p1,'Purchaser Signature:',M,y-7,{bold:true,size:9}); dt(p1,'_________________________________',M+120,y-7,{size:9});
-    dt(p1,'Date:',M+375,y-7,{bold:true,size:9}); dt(p1,'__________',M+400,y-7,{size:9});
-    y -= 20;
+    dt(p1,'Date:',M+372,y-7,{bold:true,size:9}); dt(p1,'__________',M+398,y-7,{size:9});
+    y-=20;
     dt(p1,'Direct Truck Sales:',M,y-7,{bold:true,size:9}); dt(p1,'_________________________________',M+120,y-7,{size:9});
-    dt(p1,'Date:',M+375,y-7,{bold:true,size:9}); dt(p1,'__________',M+400,y-7,{size:9});
+    dt(p1,'Date:',M+372,y-7,{bold:true,size:9}); dt(p1,'__________',M+398,y-7,{size:9});
 
-    // ── PAGE 2 — T&C ──────────────────────────────────────────────────────────
-    const p2 = makePage();
-    let y2 = H-38;
-    await addLogo(p2,M,y2);
-    dt(p2,'15w740 N. Frontage Rd, Ste 2  |  Burr Ridge, IL 60527  |  630-701-1000',W/2-130,y2,{size:8});
-    dt(p2,'Sales@Direct-Truck.com  |  Finance@Direct-Truck.com',W/2-88,y2-12,{size:8,color:[0,0.3,0.7]});
-    y2-=46; p2.drawLine({start:{x:M,y:y2},end:{x:W-M,y:y2},thickness:2,color:rgb(0.85,0.45,0.1)}); y2-=14;
-
-    box(p2,M,y2-30,W-M*2,40);
-    dt(p2,`${d.year||''} ${d.make||''} ${d.model||''}`,M+8,y2-8,{bold:true,size:9});
-    dt(p2,'VIN:',M+220,y2-8,{bold:true,size:8.5}); dt(p2,d.vin||'',M+244,y2-8,{size:8.5,maxWidth:150});
-    dt(p2,'Unit:',M+415,y2-8,{bold:true,size:8.5}); dt(p2,d.unit||'',M+442,y2-8,{size:8.5});
-    y2-=44;
-    dt(p2,"Terms and Conditions — Used Vehicle Dealer's Warranty Disclaimer",M,y2,{bold:true,size:9.5}); y2-=16;
-    p2.drawText(`The above-described motor vehicle is sold "as is" with all faults. Seller makes no warranty of merchantability or fitness for any purpose. Buyer bears all repair costs for any defects. Direct Truck Sales Inc shall not be liable for consequential damages, loss of use, loss of profits, or any incidental damages. Buyer is responsible for all registration and title fees. Buyer confirms inspection and/or test drive of the vehicle and that their purchase decision is based on that inspection. All manufacturer warranties, if any, are the manufacturer's alone. Buyer and all affiliated parties release Direct Truck Sales Inc from any current or future liabilities related to this purchase. Upon completion buyer is solely responsible for the vehicle's performance, operation, and safety.`,
+    // ── PAGE 2: T&C ───────────────────────────────────────────────────────────
+    const p2=pdfDoc.addPage([W,H]);
+    let y2=await addHeader(p2,'TERMS & CONDITIONS');
+    // Vehicle summary
+    box(p2,M,y2-32,W-M*2,44);
+    units.forEach((u,i)=>{
+      dt(p2,`${u.year||''} ${u.make||''} ${u.model||''}`,M+8,y2-10-(i*14),{bold:true,size:9,maxWidth:200});
+      dt(p2,'VIN: '+(u.vin||''),M+216,y2-10-(i*14),{size:8.5,maxWidth:165});
+      dt(p2,'Unit: '+(u.unit||''),M+400,y2-10-(i*14),{size:8.5});
+    });
+    y2-=46;
+    dt(p2,"Terms — Used Vehicle Dealer's Warranty Disclaimer",M,y2,{bold:true,size:9.5}); y2-=16;
+    p2.drawText(`The above-described motor vehicle(s) are sold "as is" with all faults. No warranty of merchantability or fitness is made. Buyer bears all repair costs. Direct Truck Sales Inc shall not be liable for consequential or incidental damages. Buyer is responsible for all registration and title fees, confirms inspection and purchase decision based thereon. All manufacturer warranties are the manufacturer's alone. Buyer releases Direct Truck Sales Inc from any current or future liabilities. Upon completion buyer is solely responsible for the vehicle.`,
       {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
-    y2-=130;
+    y2-=100;
     dt(p2,'Release from Liability',M,y2,{bold:true,size:9}); y2-=14;
-    p2.drawText('I fully and forever release and discharge Direct Truck Sales Inc from any and all injuries, losses, damages, claims, and liabilities of any kind arising from or related to my use of the motor vehicle, even if due to the negligence of the released parties, to the fullest extent permitted by law.',
+    p2.drawText('I fully and forever release and discharge Direct Truck Sales Inc from all injuries, losses, damages, claims and liabilities arising from my use of the motor vehicle(s), even if due to their negligence, to the fullest extent permitted by law.',
       {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
-    y2-=52; ln(p2,y2+8);
+    y2-=50; ln(p2,y2+8);
     dt(p2,'Purchaser Signature:',M,y2-7,{bold:true,size:9}); dt(p2,'_________________________________',M+120,y2-7,{size:9});
-    dt(p2,'Date:',M+375,y2-7,{bold:true,size:9}); dt(p2,'__________',M+400,y2-7,{size:9});
+    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9}); dt(p2,'__________',M+398,y2-7,{size:9});
     y2-=20;
     dt(p2,'Direct Truck Sales:',M,y2-7,{bold:true,size:9}); dt(p2,'_________________________________',M+120,y2-7,{size:9});
-    dt(p2,'Date:',M+375,y2-7,{bold:true,size:9}); dt(p2,'__________',M+400,y2-7,{size:9});
+    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9}); dt(p2,'__________',M+398,y2-7,{size:9});
 
-    // ── PAGE 3 — WORKORDER (only if items) ────────────────────────────────────
-    const items=[d.item1,d.item2,d.item3,d.item4].filter(Boolean);
-    if(items.length>0){
-      const p3=makePage(); let y3=H-38;
-      await addLogo(p3,M,y3);
-      dt(p3,'15w740 N. Frontage Rd, Ste 2  |  Burr Ridge, IL 60527  |  630-701-1000',W/2-130,y3,{size:8});
-      y3-=46; p3.drawLine({start:{x:M,y:y3},end:{x:W-M,y:y3},thickness:2,color:rgb(0.85,0.45,0.1)}); y3-=16;
-      dt(p3,'WORKORDER — Additional Items',M,y3,{bold:true,size:13}); y3-=20;
-      box(p3,M,y3-58,W-M*2,70);
-      dt(p3,`Stock #: ${d.unit||''}`,M+8,y3-8,{bold:true,size:9.5});
-      dt(p3,`Make: ${d.make||''}`,M+160,y3-8,{size:9.5});
-      dt(p3,`Model: ${d.model||''}`,M+290,y3-8,{size:9.5});
-      dt(p3,`VIN: ${d.vin||''}`,M+8,y3-24,{size:9});
-      dt(p3,`Purchaser: ${d.personalName||''}${d.businessName?' / '+d.businessName:''}`,M+8,y3-40,{size:9});
-      y3-=76;
-      dt(p3,'Items to be completed:',M,y3,{bold:true,size:10}); y3-=18;
+    // ── PAGE(S) 3+: WORKORDER per unit ───────────────────────────────────────
+    for(let ui=0;ui<units.length;ui++){
+      const u=units[ui];
+      const items=[u.item1,u.item2,u.item3,u.item4].filter(Boolean);
+      if(!items.length) continue;
+      const pw=pdfDoc.addPage([W,H]);
+      let yw=await addHeader(pw,`WORKORDER — Unit ${ui+1}`);
+      box(pw,M,yw-58,W-M*2,70);
+      dt(pw,`Stock #: ${u.unit||''}`,M+8,yw-8,{bold:true,size:9.5});
+      dt(pw,`Make: ${u.make||''}`,M+160,yw-8,{size:9.5});
+      dt(pw,`Model: ${u.model||''}`,M+290,yw-8,{size:9.5});
+      dt(pw,`VIN: ${u.vin||''}`,M+8,yw-24,{size:9});
+      dt(pw,`Purchaser: ${d.personalName||''}${d.businessName?' / '+d.businessName:''}`,M+8,yw-40,{size:9});
+      yw-=76;
+      dt(pw,'Items to be completed:',M,yw,{bold:true,size:10}); yw-=18;
       items.forEach((item,i)=>{
-        box(p3,M,y3-26,W-M*2,30,[0.97,0.97,0.97]);
-        dt(p3,`${i+1}.`,M+8,y3-10,{bold:true,size:10});
-        dt(p3,item,M+24,y3-10,{size:10,maxWidth:W-M*2-32});
-        y3-=38;
+        pw.drawRectangle({x:M,y:yw-26,width:W-M*2,height:30,color:rgb(0.97,0.97,0.97),borderColor:rgb(0.85,0.85,0.85),borderWidth:0.5});
+        dt(pw,`${i+1}.`,M+8,yw-10,{bold:true,size:10});
+        dt(pw,item,M+24,yw-10,{size:10,maxWidth:W-M*2-32});
+        yw-=38;
       });
-      y3-=20;
-      p3.drawText('The purchaser will be responsible for work performed if the sale is terminated. Work completed once fully funded. Once work has started, deposits are non-refundable.',
-        {x:M,y:y3,size:8,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:12});
-      y3-=40; ln(p3,y3+8);
-      dt(p3,'Purchaser:',M,y3-7,{bold:true,size:9}); dt(p3,'_________________________________',M+70,y3-7,{size:9});
-      dt(p3,'Date:',M+320,y3-7,{bold:true,size:9}); dt(p3,'__________',M+348,y3-7,{size:9});
-      y3-=20;
-      dt(p3,'Direct Truck Sales:',M,y3-7,{bold:true,size:9}); dt(p3,'_________________________________',M+122,y3-7,{size:9});
-      dt(p3,'Date:',M+375,y3-7,{bold:true,size:9}); dt(p3,'__________',M+400,y3-7,{size:9});
+      yw-=20;
+      pw.drawText('The purchaser will be responsible for work performed if the sale is terminated. Work completed once fully funded. Once started, deposits are non-refundable.',
+        {x:M,y:yw,size:8,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:12});
+      yw-=40; ln(pw,yw+8);
+      dt(pw,'Purchaser:',M,yw-7,{bold:true,size:9}); dt(pw,'_________________________________',M+70,yw-7,{size:9});
+      dt(pw,'Date:',M+322,yw-7,{bold:true,size:9}); dt(pw,'__________',M+348,yw-7,{size:9});
+      yw-=20;
+      dt(pw,'Direct Truck Sales:',M,yw-7,{bold:true,size:9}); dt(pw,'_________________________________',M+122,yw-7,{size:9});
+      dt(pw,'Date:',M+374,yw-7,{bold:true,size:9}); dt(pw,'__________',M+400,yw-7,{size:9});
     }
 
     const pdfBytes=await pdfDoc.save();
     const safeName=(d.personalName||d.businessName||'BillOfSale').replace(/[^a-zA-Z0-9]/g,'_');
-    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}_${d.unit||''}.pdf"`});
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}.pdf"`});
     res.send(Buffer.from(pdfBytes));
-  } catch(e) {
-    console.error('Bill of sale PDF error:',e);
+  } catch(e){
+    console.error('BOS PDF error:',e);
     res.status(500).json({error:'PDF generation failed: '+e.message});
   }
 });
+
 
 // ── BILL OF SALE — SAVE ────────────────────────────────────────────────────────
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
