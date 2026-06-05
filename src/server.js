@@ -364,31 +364,31 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     dt(p1,'DL # / State:',col2,y,{bold:true,size:8.5}); dt(p1,`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`,col2+LW,y,{size:8.5,maxWidth:VW});
     y -= 18;
 
-    // ── VEHICLE ───────────────────────────────────────────────────────────────
-    box(p1,M,y-60,W-M*2,72);
-    dt(p1,'VEHICLE',col1,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+    // ── VEHICLE(S) ────────────────────────────────────────────────────────────
+    const units = d.units && d.units.length > 0 ? d.units : [{unit:d.unit,year:d.year,make:d.make,model:d.model,vin:d.vin,miles:d.miles,apu:d.apu,color:d.color,ratio:d.ratio,hp:d.hp}];
+    const vBoxH = units.length * 28 + 20;
+    box(p1,M,y-vBoxH,W-M*2,vBoxH+12);
+    dt(p1,units.length>1?`VEHICLES (${units.length})`:'VEHICLE',col1,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
     y -= 16;
-    // Year / Make / Model / VIN / Unit in one row
-    const vc=[{l:'Year:',v:d.year||''},{l:'Make:',v:d.make||''},{l:'Model:',v:d.model||''},{l:'VIN:',v:d.vin||''},{l:'Unit #:',v:d.unit||''}];
-    const vcStarts=[M+6,M+80,M+175,M+285,M+440];
-    const vcLW=[36,36,36,30,38];
-    vc.forEach((f,i)=>{
-      dt(p1,f.l,vcStarts[i],y,{bold:true,size:8});
-      dt(p1,f.v,vcStarts[i]+vcLW[i],y,{size:8.5,maxWidth:i===3?140:90});
+    units.forEach((u,ui) => {
+      if(ui>0) { ln(p1,y+4,M+4,W-M-4,0.3); y-=2; }
+      if(units.length>1) dt(p1,`Unit ${ui+1}:`,M+6,y,{bold:true,size:8,color:[0.3,0.3,0.3]});
+      const vcStarts=units.length>1?[M+50,M+115,M+210,M+310,M+445]:[M+6,M+80,M+175,M+285,M+440];
+      const vcLW=units.length>1?[34,34,34,28,36]:[36,36,36,30,38];
+      [{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit #:',v:u.unit||''}].forEach((f,i)=>{
+        dt(p1,f.l,vcStarts[i],y,{bold:true,size:7.5});
+        dt(p1,f.v,vcStarts[i]+vcLW[i],y,{size:8.5,maxWidth:i===3?120:85});
+      });
+      y -= 13;
+      const optPairs=[['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]];
+      let optX=M+6; optPairs.forEach(([k,v])=>{if(v){dt(p1,k+':',optX,y,{bold:true,size:7.5}); dt(p1,String(v),optX+34,y,{size:8,maxWidth:65}); optX+=100;}});
+      y -= 14;
     });
-    y -= 14;
-    // Options row
-    const optPairs=[['Miles',d.miles],['APU',d.apu],['Color',d.color],['Ratio',d.ratio],['HP',d.hp]];
-    let optX = M+6;
-    optPairs.forEach(([k,v])=>{
-      if(v){dt(p1,k+':',optX,y,{bold:true,size:8}); dt(p1,String(v),optX+38,y,{size:8,maxWidth:70}); optX+=110;}
-    });
-    y -= 14;
     // Warranty + Service contract on same row
-    dt(p1,'Warranty:',col1,y,{bold:true,size:8.5}); dt(p1,d.warrantyCoverage||'AS-IS',col1+58,y,{size:8.5,maxWidth:160});
+    dt(p1,'Warranty:',col1,y,{bold:true,size:8.5}); dt(p1,d.warrantyCoverage||'AS-IS',col1+58,y,{size:8.5,maxWidth:155});
     if(d.serviceContractLevel){
       dt(p1,'Service Contract:',col2,y,{bold:true,size:8.5});
-      dt(p1,`${d.serviceContractLevel} — ${d.serviceContractCoverage||''}`,col2+102,y,{size:8.5,maxWidth:160});
+      dt(p1,`${d.serviceContractLevel} — ${d.serviceContractCoverage||''}`,col2+105,y,{size:8.5,maxWidth:155});
     }
     y -= 20;
 
@@ -398,25 +398,34 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     dt(p1,'FINANCIAL SUMMARY',finX,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
     y -= 18;
 
+    // Financial summary — fixed label column + right-aligned value column
+    const labelCol = finX + 4;
+    const valueCol = W - M - 4;
     const finRows = [
-      ['Sales Price:',         fmtMoney(d.salePrice)],
-      ['Service Contract:',    d.serviceContractPrice && parseFloat(d.serviceContractPrice)>0 ? fmtMoney(d.serviceContractPrice) : ''],
-      ['Sales Tax:',           fmtMoney(d.salesTax)],
-      ['IL Title Fee:',        fmtMoney(d.titleFee)],
-      ['Doc Fee:',             fmtMoney(d.docFee||350)],
-      ['Deposit:',             d.depositAmount && parseFloat(d.depositAmount)>0 ? `${fmtMoney(d.depositAmount)} (${d.depositType||''})` : ''],
+      ['Sales Price:',      fmtMoney(d.salePrice)],
+      ['Service Contract:', d.serviceContractPrice && parseFloat(d.serviceContractPrice)>0 ? fmtMoney(d.serviceContractPrice) : null],
+      ['Sales Tax:',        d.salesTax && parseFloat(d.salesTax)>0 ? fmtMoney(d.salesTax) : null],
+      ['IL Title Fee:',     d.titleFee && parseFloat(d.titleFee)>0 ? fmtMoney(d.titleFee) : null],
+      ['Doc Fee:',          fmtMoney(d.docFee||350)],
+      ['Deposit:',          d.depositAmount && parseFloat(d.depositAmount)>0 ? `- ${fmtMoney(d.depositAmount)}` : null],
     ];
     finRows.forEach(([label,val])=>{
       if(!val) return;
-      dt(p1,label,finX,y,{bold:true,size:8.5});
-      dt(p1,val,finX+finW-96,y,{size:8.5,maxWidth:94});
+      dt(p1,label,labelCol,y,{bold:true,size:8.5,maxWidth:90});
+      // Right-align value
+      const valW = val.length * 5.5;
+      dt(p1,val,valueCol-valW,y,{size:8.5,maxWidth:90});
       p1.drawLine({start:{x:finX,y:y-3},end:{x:W-M,y:y-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
-      y-=14;
+      if(label==='Deposit:') { // add deposit type below if present
+        if(d.depositType){ dt(p1,'('+d.depositType+')',labelCol+52,y-11,{size:7.5,color:[0.5,0.5,0.5],maxWidth:80}); y-=11; }
+      }
+      y-=15;
     });
-    y-=4; p1.drawLine({start:{x:finX,y},end:{x:W-M,y},thickness:1,color:rgb(0.2,0.2,0.2)}); y-=14;
-    dt(p1,'TOTAL:',finX,y,{bold:true,size:12});
+    y-=4; p1.drawLine({start:{x:finX,y},end:{x:W-M,y},thickness:1.5,color:rgb(0.2,0.2,0.2)}); y-=15;
+    dt(p1,'TOTAL:',labelCol,y,{bold:true,size:11});
     const totalVal = fmtMoney(d.total);
-    dt(p1,totalVal||'',finX+finW-96,y,{bold:true,size:12,color:[0.05,0.42,0.1]});
+    const tvW = (totalVal||'').length * 6.8;
+    dt(p1,totalVal||'',valueCol-tvW,y,{bold:true,size:13,color:[0.05,0.42,0.1]});
 
     // ── TERMS ─────────────────────────────────────────────────────────────────
     y = 200;
