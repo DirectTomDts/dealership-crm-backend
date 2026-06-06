@@ -1,18 +1,21 @@
-const express = require('express');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
+const express    = require('express');
+const cors       = require('cors');
+const jwt        = require('jsonwebtoken');
+const path       = require('path');
+const fs         = require('fs');
 const { google } = require('googleapis');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // ── CONFIG ─────────────────────────────────────────────────────────────────────
 const JWT_SECRET   = process.env.JWT_SECRET || 'change-this-secret';
 const SHEET_ID     = process.env.SHEET_ID;
 const SHEET_NAME   = process.env.SHEET_NAME || 'Sheet1';
 const INV_SHEET_ID = '1_R2mmi6O_KQW1mSd1Nu26fJDwrXKtRwH9vTwGnA2fN4';
+const FORMS_DIR    = path.join(__dirname, '..', 'forms');
 
 const USERS = [
   { username:'don',     password: process.env.PASS_DON     || 'Don2024!',     name:'Don',     role:'sales' },
@@ -67,7 +70,7 @@ const DOWC_LEVELS = {
   ],
 };
 
-// ── GOOGLE SHEETS AUTH ─────────────────────────────────────────────────────────
+// ── GOOGLE AUTH ────────────────────────────────────────────────────────────────
 function getSheetsClient() {
   const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
   const auth = new google.auth.GoogleAuth({ credentials, scopes:['https://www.googleapis.com/auth/spreadsheets'] });
@@ -82,10 +85,38 @@ function requireAuth(req, res, next) {
   catch { res.status(401).json({ error:'Invalid token' }); }
 }
 
+// ── HELPERS ────────────────────────────────────────────────────────────────────
+const fmtPhone = (p) => {
+  if (!p) return ['','',''];
+  const d = p.replace(/\D/g,'');
+  return [d.slice(0,3), d.slice(3,6), d.slice(6,10)];
+};
+
+const agentLine = (name, company) => {
+  if (name && company) return `${name}, agent for ${company}`;
+  return name || company || '';
+};
+
+async function fillPdfFields(formBytes, fieldMap) {
+  const pdfDoc = await PDFDocument.load(formBytes, { ignoreEncryption:true });
+  const form = pdfDoc.getForm();
+  for (const [name, value] of Object.entries(fieldMap)) {
+    try {
+      const field = form.getField(name);
+      const type  = field.constructor.name;
+      if      (type === 'PDFTextField')  field.setText(String(value||''));
+      else if (type === 'PDFCheckBox')   { if (value) field.check(); else field.uncheck(); }
+      else if (type === 'PDFRadioGroup') field.select(String(value));
+    } catch(e) {}
+  }
+  form.flatten();
+  return await pdfDoc.save();
+}
+
 // ── HEALTH ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status:'Dealer CRM API running' }));
 
-// ── LOGIN ──────────────────────────────────────────────────────────────────────
+// ── AUTH ───────────────────────────────────────────────────────────────────────
 app.post('/auth/login', (req, res) => {
   const { username, password } = req.body;
   const user = USERS.find(u => u.username === username.toLowerCase() && u.password === password);
@@ -94,7 +125,7 @@ app.post('/auth/login', (req, res) => {
   res.json({ token, name:user.name, role:user.role });
 });
 
-// ── DOWC LEVELS ────────────────────────────────────────────────────────────────
+// ── DOWC ───────────────────────────────────────────────────────────────────────
 app.get('/dowc-levels', requireAuth, (req, res) => res.json(DOWC_LEVELS));
 
 // ── LEADS ──────────────────────────────────────────────────────────────────────
@@ -168,102 +199,87 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
     const fontBold   = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
     const font       = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
-    const margin = 48;
-    let y = height - 48;
+    const M = 48; let y = height - 48;
 
     const dt = (text, x, yPos, opts={}) => {
       try { page.drawText(String(text||''), { x, y:yPos, size:opts.size||10, font:opts.bold?fontBold:(opts.italic?fontItalic:font), color:rgb(0,0,0), maxWidth:opts.maxWidth||500 }); } catch(e){}
     };
-    const ln = (yPos, x1=margin, x2=width-margin) => {
-      page.drawLine({ start:{x:x1,y:yPos}, end:{x:x2,y:yPos}, thickness:0.5, color:rgb(0.5,0.5,0.5) });
-    };
+    const ln = (yPos, x1=M, x2=width-M) => page.drawLine({ start:{x:x1,y:yPos}, end:{x:x2,y:yPos}, thickness:0.5, color:rgb(0.5,0.5,0.5) });
 
-    dt('TEST DRIVE AGREEMENT', margin, y, {bold:true, size:15});
-    y -= 6;
-    dt('Direct Truck Sales Inc.  |  15w740 N. Frontage Rd, Burr Ridge, Illinois', margin, y-8, {size:8, italic:true});
-    y -= 22; ln(y); y -= 14;
-    dt('The undersigned acknowledges receiving the following vehicle for test drive purposes:', margin, y, {size:9, italic:true});
-    y -= 18;
+    dt('TEST DRIVE AGREEMENT', M, y, {bold:true, size:15});
+    y-=6; dt('Direct Truck Sales Inc.  |  15w740 N. Frontage Rd, Burr Ridge, Illinois', M, y-8, {size:8, italic:true});
+    y-=22; ln(y); y-=14;
+    dt('The undersigned acknowledges receiving the following vehicle for test drive purposes:', M, y, {size:9, italic:true});
+    y-=18;
 
-    page.drawRectangle({x:margin, y:y-6, width:width-margin*2, height:50, color:rgb(0.94,0.94,0.94), borderColor:rgb(0.75,0.75,0.75), borderWidth:0.5});
-    dt('Make:',  margin+8,   y+28, {bold:true,size:9}); dt(d.make||'',  margin+44,  y+28, {size:9});
-    dt('Year:',  margin+140, y+28, {bold:true,size:9}); dt(d.year||'',  margin+168, y+28, {size:9});
-    dt('Model:', margin+218, y+28, {bold:true,size:9}); dt(d.model||'', margin+252, y+28, {size:9});
-    dt('VIN / Serial #:', margin+8,   y+10, {bold:true,size:9}); dt(d.vin||'',  margin+86,  y+10, {size:9, maxWidth:160});
-    dt('Stock #:',        margin+270, y+10, {bold:true,size:9}); dt(d.unit||'', margin+314, y+10, {size:9});
-    dt('Plate #:',        margin+380, y+10, {bold:true,size:9}); dt(d.plate||'',margin+422, y+10, {size:9});
-    y -= 62;
+    page.drawRectangle({x:M,y:y-6,width:width-M*2,height:50,color:rgb(0.94,0.94,0.94),borderColor:rgb(0.75,0.75,0.75),borderWidth:0.5});
+    dt('Make:',M+8,y+28,{bold:true,size:9}); dt(d.make||'',M+44,y+28,{size:9});
+    dt('Year:',M+140,y+28,{bold:true,size:9}); dt(d.year||'',M+168,y+28,{size:9});
+    dt('Model:',M+218,y+28,{bold:true,size:9}); dt(d.model||'',M+252,y+28,{size:9});
+    dt('VIN / Serial #:',M+8,y+10,{bold:true,size:9}); dt(d.vin||'',M+86,y+10,{size:9,maxWidth:160});
+    dt('Stock #:',M+270,y+10,{bold:true,size:9}); dt(d.unit||'',M+314,y+10,{size:9});
+    dt('Plate #:',M+380,y+10,{bold:true,size:9}); dt(d.plate||'',M+422,y+10,{size:9});
+    y-=62;
 
-    dt('Date:', margin, y, {bold:true,size:9}); dt(d.date||'', margin+36, y, {size:9});
-    dt('Return by:', margin+180, y, {bold:true,size:9}); dt(d.returnTime||'', margin+240, y, {size:9});
-    y -= 18; ln(y); y -= 12;
+    dt('Date:',M,y,{bold:true,size:9}); dt(d.date||'',M+36,y,{size:9});
+    dt('Return by:',M+180,y,{bold:true,size:9}); dt(d.returnTime||'',M+240,y,{size:9});
+    y-=18; ln(y); y-=12;
 
-    dt('CONDITIONS & REPRESENTATIONS:', margin, y, {bold:true, size:9}); y -= 13;
+    dt('CONDITIONS & REPRESENTATIONS:', M, y, {bold:true,size:9}); y-=13;
     const conditions = [
       "Vehicle shall be returned within 3 hours or on dealer's demand, free of liens, in the same condition as received, or undersigned shall pay for all repairs necessary.",
       'Undersigned shall pay dealer immediately the full present retail value of the vehicle if it is not returned for any reason whatsoever.',
       'Vehicle is to be driven exclusively by the undersigned for test drive purposes only and shall not be used for transportation of persons or property for hire.',
-      "Vehicle shall not be operated in violation of any law (Federal, State, or local), nor driven beyond a radius of 25 miles from dealer's place of business.",
+      "Vehicle shall not be operated in violation of any law, nor driven beyond a radius of 25 miles from dealer's place of business.",
       'Vehicle will be preserved and protected from all loss, damage, or injury. Unit is GPS monitored and shall not be modified or altered in any way.',
     ];
     conditions.forEach(c => {
-      page.drawText('\u2022  '+c, {x:margin+8, y, size:8.2, font, color:rgb(0,0,0), maxWidth:width-margin*2-16, lineHeight:12});
+      page.drawText('\u2022  '+c, {x:M+8,y,size:8.2,font,color:rgb(0,0,0),maxWidth:width-M*2-16,lineHeight:12});
       y -= (Math.ceil(c.length/100)*12)+7;
     });
 
-    y -= 4; ln(y); y -= 12;
-    dt('DYNO Testing NOT allowed', margin, y, {bold:true,size:9}); dt('Initials: ____________', width-margin-130, y, {size:9});
-    y -= 13;
-    dt('Calibration, programming, and Parked Forced Regeneration NOT allowed', margin, y, {italic:true,size:9}); dt('Initials: ____________', width-margin-130, y, {size:9});
-    y -= 16; ln(y); y -= 12;
+    y-=4; ln(y); y-=12;
+    dt('DYNO Testing NOT allowed',M,y,{bold:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
+    y-=13;
+    dt('Calibration, programming, and Parked Forced Regeneration NOT allowed',M,y,{italic:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
+    y-=16; ln(y); y-=12;
 
     const dlTxt = `The undersigned represents that he/she is duly and legally licensed to operate a vehicle under license number [${d.dlNumber||'________________'}] State [${d.dlState||'IL'}] and has no physical conditions that could cause him/her to be unfit to drive said vehicle.`;
-    page.drawText(dlTxt, {x:margin, y, size:8, font, color:rgb(0,0,0), maxWidth:width-margin*2, lineHeight:12});
-    y -= 36; ln(y); y -= 14;
+    page.drawText(dlTxt,{x:M,y,size:8,font,color:rgb(0,0,0),maxWidth:width-M*2,lineHeight:12});
+    y-=36; ln(y); y-=14;
 
-    const half = (width-margin*2)/2;
-    dt('SALESPERSON:',    margin,      y,    {bold:true,size:9}); dt(d.salesperson||'', margin+78,   y,    {size:9});
-    dt('DATE:',           margin,      y-16, {bold:true,size:9}); dt(d.date||'',        margin+38,   y-16, {size:9});
-    dt('DRIVER LICENSE:', margin,      y-32, {bold:true,size:9}); dt(`${d.dlNumber||''} (${d.dlState||'IL'})`, margin+98, y-32, {size:9});
-    dt('CUSTOMER SIGNATURE:', margin+half+8, y,    {bold:true,size:9}); ln(y-2, margin+half+140, width-margin);
-    dt('ADDRESS:',            margin+half+8, y-16, {bold:true,size:9}); dt(`${d.address||''}, ${d.city||''}, ${d.state||''} ${d.zip||''}`, margin+half+66, y-16, {size:9, maxWidth:half-70});
-    dt('CUSTOMER NAME:',      margin+half+8, y-32, {bold:true,size:9}); dt(d.customerName||'', margin+half+104, y-32, {size:9});
-    y -= 50; ln(y); y -= 10;
-    dt('Direct Truck Sales Inc. — Test Drive Agreement', margin, y, {size:7, italic:true});
+    const half=(width-M*2)/2;
+    dt('SALESPERSON:',M,y,{bold:true,size:9}); dt(d.salesperson||'',M+78,y,{size:9});
+    dt('DATE:',M,y-16,{bold:true,size:9}); dt(d.date||'',M+38,y-16,{size:9});
+    dt('DRIVER LICENSE:',M,y-32,{bold:true,size:9}); dt(`${d.dlNumber||''} (${d.dlState||'IL'})`,M+98,y-32,{size:9});
+    dt('CUSTOMER SIGNATURE:',M+half+8,y,{bold:true,size:9}); ln(y-2,M+half+140,width-M);
+    dt('ADDRESS:',M+half+8,y-16,{bold:true,size:9}); dt(`${d.address||''}, ${d.city||''}, ${d.state||''} ${d.zip||''}`,M+half+66,y-16,{size:9,maxWidth:half-70});
+    dt('CUSTOMER NAME:',M+half+8,y-32,{bold:true,size:9}); dt(d.customerName||'',M+half+104,y-32,{size:9});
+    y-=50; ln(y); y-=10;
+    dt('Direct Truck Sales Inc. — Test Drive Agreement',M,y,{size:7,italic:true});
 
     const pdfBytes = await pdfDoc.save();
     const safeName = (d.customerName||'Agreement').replace(/[^a-zA-Z0-9]/g,'_');
     res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="TestDrive_${safeName}_${d.date||'nodate'}.pdf"`});
     res.send(Buffer.from(pdfBytes));
-  } catch(e) {
-    console.error('Test drive PDF error:', e);
-    res.status(500).json({ error:'PDF generation failed: '+e.message });
-  }
+  } catch(e) { console.error('Test drive PDF error:',e); res.status(500).json({ error:'PDF generation failed: '+e.message }); }
 });
 
-// ── TEST DRIVE — SAVE ──────────────────────────────────────────────────────────
 app.post('/testdrive/save', requireAuth, async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const d = req.body;
-    const TD_SHEET = 'TestDrives';
+    const sheets = getSheetsClient(); const d = req.body; const TD_SHEET = 'TestDrives';
     let hasHeader = false;
-    try { const c = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1` }); hasHeader = c.data.values && c.data.values.length > 0; } catch(e) {}
+    try { const c = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1` }); hasHeader = !!(c.data.values?.length); } catch(e){}
     if (!hasHeader) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1`, valueInputOption:'RAW',
-        requestBody:{ values:[['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] }
-      });
+      await sheets.spreadsheets.values.update({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1`, valueInputOption:'RAW',
+        requestBody:{ values:[['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] } });
     }
-    await sheets.spreadsheets.values.append({
-      spreadsheetId:SHEET_ID, range:TD_SHEET, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
-      requestBody:{ values:[[d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']] }
-    });
+    await sheets.spreadsheets.values.append({ spreadsheetId:SHEET_ID, range:TD_SHEET, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
+      requestBody:{ values:[[d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']] } });
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save record' }); }
 });
 
-// ── TEST DRIVE — HISTORY ───────────────────────────────────────────────────────
 app.get('/testdrive/history', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
@@ -294,170 +310,121 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     const pdfDoc = await PDFDocument.create();
     const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
     const font     = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const W=612, H=792, M=44;
+    const W=612,H=792,M=44;
 
     const dt = (pg,text,x,yPos,opts={}) => {
       try{ pg.drawText(String(text||''),{x,y:yPos,size:opts.size||9,font:opts.bold?fontBold:font,color:rgb(...(opts.color||[0,0,0])),maxWidth:opts.maxWidth||(W-M-x)}); }catch(e){}
     };
-    const ln = (pg,yPos,x1=M,x2=W-M,t=0.5) => pg.drawLine({start:{x:x1,y:yPos},end:{x:x2,y:yPos},thickness:t,color:rgb(0.75,0.75,0.75)});
-    const box = (pg,x,y,w,h,fill=[0.95,0.95,0.95]) => pg.drawRectangle({x,y,width:w,height:h,color:rgb(...fill),borderColor:rgb(0.82,0.82,0.82),borderWidth:0.5});
-    const fmtM = v => { const n=parseFloat(String(v||'0').replace(/[$,]/g,'')); return (!v||isNaN(n)||n===0)?null:'$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+    const ln=(pg,yPos,x1=M,x2=W-M,t=0.5)=>pg.drawLine({start:{x:x1,y:yPos},end:{x:x2,y:yPos},thickness:t,color:rgb(0.75,0.75,0.75)});
+    const box=(pg,x,y,w,h,fill=[0.95,0.95,0.95])=>pg.drawRectangle({x,y,width:w,height:h,color:rgb(...fill),borderColor:rgb(0.82,0.82,0.82),borderWidth:0.5});
+    const fmtM=v=>{const n=parseFloat(String(v||'0').replace(/[$,]/g,''));return(!v||isNaN(n)||n===0)?null:'$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});};
 
-    // Header block — same layout on every page
-    const addHeader = async (pg, title) => {
-      let y = H-36;
-      // Logo left
-      try{
-        const img = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
-        const dims = img.scaleToFit(130,46);
-        pg.drawImage(img,{x:M,y:y-dims.height+8,width:dims.width,height:dims.height});
-      }catch(e){}
-      // Company info RIGHT-ALIGNED block
-      const infoX = W-M-165;
-      dt(pg,'Direct Truck Sales Inc.',infoX,y,{bold:true,size:9});
-      dt(pg,'15w740 N. Frontage Rd, Ste 2',infoX,y-12,{size:8});
-      dt(pg,'Burr Ridge, IL 60527',infoX,y-23,{size:8});
-      dt(pg,'630-701-1000',infoX,y-34,{size:8});
-      dt(pg,'Sales@Direct-Truck.com',infoX,y-45,{size:8,color:[0,0.3,0.7]});
-      dt(pg,'Finance@Direct-Truck.com',infoX,y-56,{size:8,color:[0,0.3,0.7]});
-      y -= 68;
-      // Title bar
+    const addHeader = async(pg,title) => {
+      let y=H-36;
+      try{const img=await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));const dims=img.scaleToFit(130,46);pg.drawImage(img,{x:M,y:y-dims.height+8,width:dims.width,height:dims.height});}catch(e){}
+      const ax=W-M-165;
+      dt(pg,'Direct Truck Sales Inc.',ax,y,{bold:true,size:9});
+      dt(pg,'15w740 N. Frontage Rd, Ste 2',ax,y-12,{size:8});
+      dt(pg,'Burr Ridge, IL 60527',ax,y-23,{size:8});
+      dt(pg,'630-701-1000',ax,y-34,{size:8});
+      dt(pg,'Sales@Direct-Truck.com',ax,y-45,{size:8,color:[0,0.3,0.7]});
+      dt(pg,'Finance@Direct-Truck.com',ax,y-56,{size:8,color:[0,0.3,0.7]});
+      y-=68;
       pg.drawRectangle({x:M,y:y-14,width:W-M*2,height:20,color:rgb(0.12,0.12,0.12)});
       dt(pg,title,W/2-40,y-8,{bold:true,size:12,color:[1,1,1]});
       dt(pg,'Date: '+(d.date||''),W-M-104,y-8,{size:8.5,color:[0.9,0.9,0.9]});
       return y-28;
     };
 
-    // ── PAGE 1: PURCHASER + UNIT 1 ────────────────────────────────────────────
-    const p1 = pdfDoc.addPage([W,H]);
-    let y = await addHeader(p1,'BILL OF SALE');
-
-    // Purchaser box
-    const LBL=86, VAL=W/2-M-LBL-8;
+    const p1=pdfDoc.addPage([W,H]);
+    let y=await addHeader(p1,'BILL OF SALE');
+    const LBL=86,VAL=W/2-M-LBL-8,col1=M+6,col2=W/2+6;
+    const row=(pg,yp,l1,v1,l2,v2)=>{
+      dt(pg,l1,col1,yp,{bold:true,size:8.5});dt(pg,v1||'',col1+LBL,yp,{size:8.5,maxWidth:VAL});
+      if(l2){dt(pg,l2,col2,yp,{bold:true,size:8.5});dt(pg,v2||'',col2+LBL,yp,{size:8.5,maxWidth:VAL});}
+    };
     box(p1,M,y-96,W-M*2,108);
     dt(p1,'PURCHASER',M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
     dt(p1,'Sales Rep: '+(d.salesperson||''),W-M-150,y-5,{size:8});
     y-=18;
-    // 2-column info table
-    const col1=M+6, col2=W/2+6;
-    const row=(pg,yp,l1,v1,l2,v2)=>{
-      dt(pg,l1,col1,yp,{bold:true,size:8.5}); dt(pg,v1||'',col1+LBL,yp,{size:8.5,maxWidth:VAL});
-      if(l2){dt(pg,l2,col2,yp,{bold:true,size:8.5}); dt(pg,v2||'',col2+LBL,yp,{size:8.5,maxWidth:VAL});}
-    };
-    row(p1,y,'Name:',d.personalName,'Business:',d.businessName); y-=13;
-    row(p1,y,'Address:',d.address,'Address:',(d.bizAddress||d.address)); y-=13;
+    row(p1,y,'Name:',d.personalName,'Business:',d.businessName);y-=13;
+    row(p1,y,'Address:',d.address,'Address:',(d.bizAddress||d.address));y-=13;
     const csz=`${d.city||''}, ${d.state||''} ${d.zip||''}`;
     const bcsz=d.bizCity?`${d.bizCity}, ${d.bizState||''} ${d.bizZip||''}`:csz;
-    row(p1,y,'City/St/ZIP:',csz,'City/St/ZIP:',bcsz); y-=13;
-    row(p1,y,'Phone:',d.phone,'Phone:',(d.bizPhone||d.phone)); y-=13;
-    row(p1,y,'Email:',d.email,'DL # / State:',`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`); y-=18;
+    row(p1,y,'City/St/ZIP:',csz,'City/St/ZIP:',bcsz);y-=13;
+    row(p1,y,'Phone:',d.phone,'Phone:',(d.bizPhone||d.phone));y-=13;
+    row(p1,y,'Email:',d.email,'DL # / State:',`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`);y-=18;
 
-    // Units loop — each unit gets its own full-width section (vehicle LEFT, financials RIGHT, same row)
     for(let ui=0;ui<units.length;ui++){
       const u=units[ui];
-
-      // Estimate space needed: vehicle box ~90px + warranty row + gap
-      const neededHeight = 110;
-      if(y < neededHeight + 80){ const np=pdfDoc.addPage([W,H]); y=await addHeader(np,`BILL OF SALE — Unit ${ui+1} (cont.)`); }
-
-      // --- Calculate financial rows first so we know height ---
       const finItems=[
-        ['Sale Price:',      fmtM(u.salePrice)],
+        ['Sale Price:',fmtM(u.salePrice)],
         ['Service Contract:',u.serviceContractPrice&&parseFloat(u.serviceContractPrice)>0?fmtM(u.serviceContractPrice):null],
-        ['Sales Tax:',       u.salesTax&&parseFloat(u.salesTax)>0?fmtM(u.salesTax):null],
-        ['IL Title Fee:',    u.titleFee&&parseFloat(u.titleFee)>0?fmtM(u.titleFee):null],
-        ['Doc Fee:',         fmtM(u.docFee||350)],
+        ['Sales Tax:',u.salesTax&&parseFloat(u.salesTax)>0?fmtM(u.salesTax):null],
+        ['IL Title Fee:',u.titleFee&&parseFloat(u.titleFee)>0?fmtM(u.titleFee):null],
+        ['Doc Fee:',fmtM(u.docFee||350)],
       ].filter(r=>r[1]);
-
-      // Heights
-      const vehicleRows = 3; // header + 2 data rows
-      const vH = vehicleRows * 15 + 20 + 16; // ~81px
-      const fH = finItems.length * 15 + 22;
-      const sectionH = Math.max(vH, fH) + 8;
-
-      // Draw section background
-      const topY = y;
-      box(p1, M, topY - sectionH, W-M*2, sectionH + 12, [0.97,0.97,0.97]);
-
-      // --- LEFT SIDE: Vehicle info (full width to W/2) ---
-      const vLabel = units.length > 1 ? `VEHICLE — UNIT ${ui+1}` : 'VEHICLE';
-      dt(p1, vLabel, M+6, topY-5, {bold:true, size:7.5, color:[0.4,0.4,0.4]});
-
-      let vy = topY - 18;
-      // Row 1: Year / Make / Model / VIN / Unit#  (left half only)
-      const vcX=[M+6,M+60,M+130,M+210,M+360];
-      const vcW=[30,  30,  26,   140,   34];
-      [{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit#:',v:u.unit||''}]
-        .forEach((f,i)=>{ dt(p1,f.l,vcX[i],vy,{bold:true,size:7.5}); dt(p1,f.v,vcX[i]+vcW[i],vy,{size:8.5,maxWidth:vcW[i]+14}); });
-      vy -= 13;
-
-      // Row 2: Miles / APU / Color / Ratio / HP
-      let ox = M+6;
-      [['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]].forEach(([k,v])=>{
-        if(v){ dt(p1,k+':',ox,vy,{bold:true,size:7.5}); dt(p1,String(v),ox+30,vy,{size:8,maxWidth:58}); ox+=92; }
+      const vBoxH=16+14+14+14+10;
+      const fBoxH=finItems.length*16+22;
+      const totalH=vBoxH+fBoxH+8;
+      if(y<totalH+60){const np=pdfDoc.addPage([W,H]);y=await addHeader(np,units.length>1?`BILL OF SALE — Unit ${ui+1}`:'BILL OF SALE (cont.)');}
+      const vLabel=units.length>1?`VEHICLE — UNIT ${ui+1}`:'VEHICLE';
+      box(p1,M,y-vBoxH,W-M*2,vBoxH+12,[0.96,0.96,0.96]);
+      dt(p1,vLabel,M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+      let vy=y-18;
+      dt(p1,'Year:',M+6,vy,{bold:true,size:7.5});dt(p1,u.year||'',M+36,vy,{size:8.5,maxWidth:60});
+      dt(p1,'Make:',M+98,vy,{bold:true,size:7.5});dt(p1,u.make||'',M+128,vy,{size:8.5,maxWidth:80});
+      dt(p1,'Model:',M+210,vy,{bold:true,size:7.5});dt(p1,u.model||'',M+242,vy,{size:8.5,maxWidth:90});
+      dt(p1,'VIN:',M+338,vy,{bold:true,size:7.5});dt(p1,u.vin||'',M+362,vy,{size:8.5,maxWidth:130});
+      dt(p1,'Unit#:',W-M-70,vy,{bold:true,size:7.5});dt(p1,u.unit||'',W-M-38,vy,{size:8.5,maxWidth:36});
+      vy-=14;
+      let ox=M+6;
+      [['Miles',u.miles,50],['APU',u.apu,44],['Color',u.color,52],['Ratio',u.ratio,46],['HP',u.hp,26]].forEach(([k,v,vw])=>{
+        if(v){dt(p1,k+':',ox,vy,{bold:true,size:7.5});dt(p1,String(v),ox+30,vy,{size:8,maxWidth:vw});ox+=30+vw+12;}
       });
-      vy -= 13;
-
-      // Row 3: Warranty + Service contract (left half only)
-      dt(p1,'Warranty:',M+6,vy,{bold:true,size:8}); dt(p1,u.warrantyCoverage||'AS-IS',M+56,vy,{size:8,maxWidth:140});
+      vy-=14;
+      dt(p1,'Warranty:',M+6,vy,{bold:true,size:8.5});dt(p1,u.warrantyCoverage||'AS-IS',M+62,vy,{size:8.5,maxWidth:200});
       if(u.serviceContractLevel){
-        dt(p1,'SC:',M+6,vy-13,{bold:true,size:7.5});
-        dt(p1,`${u.serviceContractLevel} — ${u.serviceContractCoverage||''}`,M+24,vy-13,{size:7.5,maxWidth:200});
-        vy -= 13;
+        dt(p1,'Service Contract:',M+280,vy,{bold:true,size:8.5});
+        dt(p1,`${u.serviceContractLevel} — ${u.serviceContractCoverage||''}`,M+380,vy,{size:8,maxWidth:130});
       }
-
-      // --- RIGHT SIDE: Financial summary box ---
-      const finX = W/2 + 6;
-      const finW = W - M - finX;
-      // Draw a separator line between left and right
-      p1.drawLine({start:{x:W/2,y:topY-4},end:{x:W/2,y:topY-sectionH+2},thickness:0.5,color:rgb(0.8,0.8,0.8)});
-
-      const finLabel = units.length > 1 ? `FINANCIALS — UNIT ${ui+1}` : 'FINANCIAL SUMMARY';
-      dt(p1, finLabel, finX, topY-5, {bold:true, size:7.5, color:[0.4,0.4,0.4]});
-
-      let fy = topY - 18;
+      y-=vBoxH+6;
+      box(p1,M,y-fBoxH,W-M*2,fBoxH+10,[0.99,0.99,0.99]);
+      dt(p1,units.length>1?`FINANCIALS — UNIT ${ui+1}`:'FINANCIAL SUMMARY',M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+      let fy=y-18;
       finItems.forEach(([lbl,val])=>{
-        dt(p1, lbl, finX, fy, {bold:true, size:8, maxWidth:90});
-        const vw = (val||'').length * 5.2;
-        dt(p1, val||'', W-M-4-vw, fy, {size:8.5, maxWidth:90});
-        p1.drawLine({start:{x:finX,y:fy-3},end:{x:W-M,y:fy-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
-        fy -= 15;
+        dt(p1,lbl,M+6,fy,{bold:true,size:8.5,maxWidth:200});
+        if(val){const vw=val.length*5.6;dt(p1,val,W-M-4-vw,fy,{size:9,maxWidth:100});}
+        p1.drawLine({start:{x:M,y:fy-3},end:{x:W-M,y:fy-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
+        fy-=16;
       });
-
-      y -= sectionH + 12;
+      y-=fBoxH+10;
     }
 
-    // Deposit + Grand total
-    if(d.depositAmount && parseFloat(d.depositAmount)>0){
-      ln(p1,y+8,W/2+4,W-M); y-=12;
-      dt(p1,'Deposit:',W/2+10,y,{bold:true,size:9}); dt(p1,`- ${fmtM(d.depositAmount)||''} (${d.depositType||''})`,W/2+70,y,{size:9,maxWidth:155});
+    if(d.depositAmount&&parseFloat(d.depositAmount)>0){
+      ln(p1,y+8,W/2+4,W-M);y-=12;
+      dt(p1,'Deposit:',W/2+10,y,{bold:true,size:9});dt(p1,`- ${fmtM(d.depositAmount)||''} (${d.depositType||''})`,W/2+70,y,{size:9,maxWidth:155});
       y-=14;
     }
-    ln(p1,y+8,W/2+4,W-M,1.5);
-    y-=16;
+    ln(p1,y+8,W/2+4,W-M,1.5);y-=16;
     dt(p1,'GRAND TOTAL:',W/2+10,y,{bold:true,size:12});
     const tvw=(fmtM(d.total)||'').length*6.5;
     dt(p1,fmtM(d.total)||'',W-M-4-tvw,y,{bold:true,size:13,color:[0.05,0.42,0.1]});
     y-=24;
-
-    // Terms
     y=Math.min(y,200);
-    ln(p1,y+14); dt(p1,'Accepted Terms and Conditions',M,y+4,{bold:true,size:8.5});
+    ln(p1,y+14);dt(p1,'Accepted Terms and Conditions',M,y+4,{bold:true,size:8.5});
     p1.drawText('Purchaser agrees this Purchase Order includes all terms as of the Date Accepted. This Invoice cancels and supersedes any prior agreement and is binding when accepted by both parties.',
       {x:M,y:y-12,size:7.5,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:11});
     y-=38;
-    dt(p1,'Purchaser declines additional warranty',M,y,{bold:true,size:8}); dt(p1,'Initials: _________',W-M-105,y,{size:8});
-    y-=22; ln(p1,y+8);
-    dt(p1,'Purchaser Signature:',M,y-7,{bold:true,size:9}); dt(p1,'_________________________________',M+120,y-7,{size:9});
-    dt(p1,'Date:',M+372,y-7,{bold:true,size:9}); dt(p1,'__________',M+398,y-7,{size:9});
+    dt(p1,'Purchaser declines additional warranty',M,y,{bold:true,size:8});dt(p1,'Initials: _________',W-M-105,y,{size:8});
+    y-=22;ln(p1,y+8);
+    dt(p1,'Purchaser Signature:',M,y-7,{bold:true,size:9});dt(p1,'_________________________________',M+120,y-7,{size:9});
+    dt(p1,'Date:',M+372,y-7,{bold:true,size:9});dt(p1,'__________',M+398,y-7,{size:9});
     y-=20;
-    dt(p1,'Direct Truck Sales:',M,y-7,{bold:true,size:9}); dt(p1,'_________________________________',M+120,y-7,{size:9});
-    dt(p1,'Date:',M+372,y-7,{bold:true,size:9}); dt(p1,'__________',M+398,y-7,{size:9});
+    dt(p1,'Direct Truck Sales:',M,y-7,{bold:true,size:9});dt(p1,'_________________________________',M+120,y-7,{size:9});
+    dt(p1,'Date:',M+372,y-7,{bold:true,size:9});dt(p1,'__________',M+398,y-7,{size:9});
 
-    // ── PAGE 2: T&C ───────────────────────────────────────────────────────────
-    const p2=pdfDoc.addPage([W,H]);
-    let y2=await addHeader(p2,'TERMS & CONDITIONS');
-    // Vehicle summary
+    const p2=pdfDoc.addPage([W,H]);let y2=await addHeader(p2,'TERMS & CONDITIONS');
     box(p2,M,y2-32,W-M*2,44);
     units.forEach((u,i)=>{
       dt(p2,`${u.year||''} ${u.make||''} ${u.model||''}`,M+8,y2-10-(i*14),{bold:true,size:9,maxWidth:200});
@@ -465,27 +432,25 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
       dt(p2,'Unit: '+(u.unit||''),M+400,y2-10-(i*14),{size:8.5});
     });
     y2-=46;
-    dt(p2,"Terms — Used Vehicle Dealer's Warranty Disclaimer",M,y2,{bold:true,size:9.5}); y2-=16;
-    p2.drawText(`The above-described motor vehicle(s) are sold "as is" with all faults. No warranty of merchantability or fitness is made. Buyer bears all repair costs. Direct Truck Sales Inc shall not be liable for consequential or incidental damages. Buyer is responsible for all registration and title fees, confirms inspection and purchase decision based thereon. All manufacturer warranties are the manufacturer's alone. Buyer releases Direct Truck Sales Inc from any current or future liabilities. Upon completion buyer is solely responsible for the vehicle.`,
+    dt(p2,"Terms — Used Vehicle Dealer's Warranty Disclaimer",M,y2,{bold:true,size:9.5});y2-=16;
+    p2.drawText("The above-described motor vehicle(s) are sold \"as is\" with all faults. No warranty of merchantability or fitness is made. Buyer bears all repair costs. Direct Truck Sales Inc shall not be liable for consequential or incidental damages. Buyer is responsible for all registration and title fees, confirms inspection and purchase decision based thereon. All manufacturer warranties are the manufacturer's alone. Buyer releases Direct Truck Sales Inc from any current or future liabilities. Upon completion buyer is solely responsible for the vehicle.",
       {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
     y2-=100;
-    dt(p2,'Release from Liability',M,y2,{bold:true,size:9}); y2-=14;
+    dt(p2,'Release from Liability',M,y2,{bold:true,size:9});y2-=14;
     p2.drawText('I fully and forever release and discharge Direct Truck Sales Inc from all injuries, losses, damages, claims and liabilities arising from my use of the motor vehicle(s), even if due to their negligence, to the fullest extent permitted by law.',
       {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
-    y2-=50; ln(p2,y2+8);
-    dt(p2,'Purchaser Signature:',M,y2-7,{bold:true,size:9}); dt(p2,'_________________________________',M+120,y2-7,{size:9});
-    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9}); dt(p2,'__________',M+398,y2-7,{size:9});
+    y2-=50;ln(p2,y2+8);
+    dt(p2,'Purchaser Signature:',M,y2-7,{bold:true,size:9});dt(p2,'_________________________________',M+120,y2-7,{size:9});
+    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9});dt(p2,'__________',M+398,y2-7,{size:9});
     y2-=20;
-    dt(p2,'Direct Truck Sales:',M,y2-7,{bold:true,size:9}); dt(p2,'_________________________________',M+120,y2-7,{size:9});
-    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9}); dt(p2,'__________',M+398,y2-7,{size:9});
+    dt(p2,'Direct Truck Sales:',M,y2-7,{bold:true,size:9});dt(p2,'_________________________________',M+120,y2-7,{size:9});
+    dt(p2,'Date:',M+372,y2-7,{bold:true,size:9});dt(p2,'__________',M+398,y2-7,{size:9});
 
-    // ── PAGE(S) 3+: WORKORDER per unit ───────────────────────────────────────
     for(let ui=0;ui<units.length;ui++){
       const u=units[ui];
       const items=[u.item1,u.item2,u.item3,u.item4].filter(Boolean);
       if(!items.length) continue;
-      const pw=pdfDoc.addPage([W,H]);
-      let yw=await addHeader(pw,`WORKORDER — Unit ${ui+1}`);
+      const pw=pdfDoc.addPage([W,H]);let yw=await addHeader(pw,`WORKORDER — Unit ${ui+1}`);
       box(pw,M,yw-58,W-M*2,70);
       dt(pw,`Stock #: ${u.unit||''}`,M+8,yw-8,{bold:true,size:9.5});
       dt(pw,`Make: ${u.make||''}`,M+160,yw-8,{size:9.5});
@@ -493,7 +458,7 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
       dt(pw,`VIN: ${u.vin||''}`,M+8,yw-24,{size:9});
       dt(pw,`Purchaser: ${d.personalName||''}${d.businessName?' / '+d.businessName:''}`,M+8,yw-40,{size:9});
       yw-=76;
-      dt(pw,'Items to be completed:',M,yw,{bold:true,size:10}); yw-=18;
+      dt(pw,'Items to be completed:',M,yw,{bold:true,size:10});yw-=18;
       items.forEach((item,i)=>{
         pw.drawRectangle({x:M,y:yw-26,width:W-M*2,height:30,color:rgb(0.97,0.97,0.97),borderColor:rgb(0.85,0.85,0.85),borderWidth:0.5});
         dt(pw,`${i+1}.`,M+8,yw-10,{bold:true,size:10});
@@ -505,98 +470,300 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
         {x:M,y:yw,size:8,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:12});
       yw-=40;
       pw.drawLine({start:{x:M,y:yw+8},end:{x:W-M,y:yw+8},thickness:0.5,color:rgb(0.75,0.75,0.75)});
-      // Purchaser signature row
-      dt(pw,'Purchaser Signature:',M,yw-7,{bold:true,size:9});
-      dt(pw,'______________________________',M+128,yw-7,{size:9});
-      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});
-      dt(pw,'________________',W/2+58,yw-7,{size:9});
+      dt(pw,'Purchaser Signature:',M,yw-7,{bold:true,size:9});dt(pw,'______________________________',M+128,yw-7,{size:9});
+      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});dt(pw,'________________',W/2+58,yw-7,{size:9});
       yw-=24;
-      // DTS signature row
-      dt(pw,'Direct Truck Sales:',M,yw-7,{bold:true,size:9});
-      dt(pw,'______________________________',M+128,yw-7,{size:9});
-      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});
-      dt(pw,'________________',W/2+58,yw-7,{size:9});
+      dt(pw,'Direct Truck Sales:',M,yw-7,{bold:true,size:9});dt(pw,'______________________________',M+128,yw-7,{size:9});
+      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});dt(pw,'________________',W/2+58,yw-7,{size:9});
     }
 
     const pdfBytes=await pdfDoc.save();
     const safeName=(d.personalName||d.businessName||'BillOfSale').replace(/[^a-zA-Z0-9]/g,'_');
     res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}.pdf"`});
     res.send(Buffer.from(pdfBytes));
-  } catch(e){
-    console.error('BOS PDF error:',e);
-    res.status(500).json({error:'PDF generation failed: '+e.message});
-  }
+  } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
 });
 
-
-// ── BILL OF SALE — SAVE ────────────────────────────────────────────────────────
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const d = req.body;
-    const BOS_SHEET = 'BillsOfSale';
-    let hasHeader = false;
-    try { const c = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${BOS_SHEET}!A1` }); hasHeader = c.data.values && c.data.values.length > 0; } catch(e) {}
-    if (!hasHeader) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId:SHEET_ID, range:`${BOS_SHEET}!A1`, valueInputOption:'RAW',
-        requestBody:{ values:[['ID','Date','Personal Name','Business Name','Address','City','State','Zip',
+    const sheets=getSheetsClient(); const d=req.body; const BOS_SHEET='BillsOfSale';
+    let hasHeader=false;
+    try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
+    if(!hasHeader){
+      await sheets.spreadsheets.values.update({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`,valueInputOption:'RAW',
+        requestBody:{values:[['ID','Date','Personal Name','Business Name','Address','City','State','Zip',
           'Biz Address','Biz City','Biz State','Biz Zip','Phone','Biz Phone','Email','DL#','DL State',
           'Unit','Year','Make','Model','VIN','Miles','APU','Color','Ratio','HP',
           'Warranty','Sale Price','SC Level','SC Coverage','SC Price','Sales Tax','Title Fee','Doc Fee',
-          'Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID','Units JSON']] }
-      });
+          'Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID','Units JSON']]}});
     }
-    const id = d.id || 'BOS'+Date.now();
-    await sheets.spreadsheets.values.append({
-      spreadsheetId:SHEET_ID, range:BOS_SHEET, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
-      requestBody:{ values:[[
-        id, d.date||new Date().toISOString().split('T')[0],
-        d.personalName||'', d.businessName||'',
-        d.address||'', d.city||'', d.state||'', d.zip||'',
-        d.bizAddress||'', d.bizCity||'', d.bizState||'', d.bizZip||'',
-        d.phone||'', d.bizPhone||'', d.email||'', d.dlNumber||'', d.dlState||'',
-        d.unit||'', d.year||'', d.make||'', d.model||'', d.vin||'',
-        d.miles||'', d.apu||'', d.color||'', d.ratio||'', d.hp||'',
-        d.warrantyCoverage||'', d.salePrice||'',
-        d.serviceContractLevel||'', d.serviceContractCoverage||'', d.serviceContractPrice||'',
-        d.salesTax||'', d.titleFee||'', d.docFee||350,
-        d.depositAmount||'', d.depositType||'', d.total||'', d.salesperson||'',
-        d.item1||'', d.item2||'', d.item3||'', d.item4||'',
-        d.leadId||'',
-        d.units ? JSON.stringify(d.units) : ''
-      ]] }
-    });
-    res.json({ success:true, id });
-  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save bill of sale' }); }
+    const id=d.id||'BOS'+Date.now();
+    await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID,range:BOS_SHEET,valueInputOption:'RAW',insertDataOption:'INSERT_ROWS',
+      requestBody:{values:[[id,d.date||new Date().toISOString().split('T')[0],
+        d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',
+        d.bizAddress||'',d.bizCity||'',d.bizState||'',d.bizZip||'',
+        d.phone||'',d.bizPhone||'',d.email||'',d.dlNumber||'',d.dlState||'',
+        d.unit||'',d.year||'',d.make||'',d.model||'',d.vin||'',
+        d.miles||'',d.apu||'',d.color||'',d.ratio||'',d.hp||'',
+        d.warrantyCoverage||'',d.salePrice||'',
+        d.serviceContractLevel||'',d.serviceContractCoverage||'',d.serviceContractPrice||'',
+        d.salesTax||'',d.titleFee||'',d.docFee||350,
+        d.depositAmount||'',d.depositType||'',d.total||'',d.salesperson||'',
+        d.item1||'',d.item2||'',d.item3||'',d.item4||'',d.leadId||'',
+        d.units?JSON.stringify(d.units):'']]}});
+    res.json({success:true,id});
+  } catch(e){console.error(e);res.status(500).json({error:'Failed to save bill of sale'});}
 });
 
-
-// ── BILL OF SALE — LIST ────────────────────────────────────────────────────────
 app.get('/billsofsale', requireAuth, async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:'BillsOfSale' });
-    const rows = response.data.values || [];
-    if (rows.length <= 1) return res.json([]);
-    const records = rows.slice(1).map(r => ({
-      id:r[0]||'', date:r[1]||'', personalName:r[2]||'', businessName:r[3]||'',
-      address:r[4]||'', city:r[5]||'', state:r[6]||'', zip:r[7]||'',
-      bizAddress:r[8]||'', bizCity:r[9]||'', bizState:r[10]||'', bizZip:r[11]||'',
-      phone:r[12]||'', bizPhone:r[13]||'', email:r[14]||'', dlNumber:r[15]||'', dlState:r[16]||'',
-      unit:r[17]||'', year:r[18]||'', make:r[19]||'', model:r[20]||'', vin:r[21]||'',
-      miles:r[22]||'', apu:r[23]||'', color:r[24]||'', ratio:r[25]||'', hp:r[26]||'',
-      warrantyCoverage:r[27]||'', salePrice:r[28]||'',
-      serviceContractLevel:r[29]||'', serviceContractCoverage:r[30]||'', serviceContractPrice:r[31]||'',
-      salesTax:r[32]||'', titleFee:r[33]||'', docFee:r[34]||'',
-      depositAmount:r[35]||'', depositType:r[36]||'', total:r[37]||'', salesperson:r[38]||'',
-      item1:r[39]||'', item2:r[40]||'', item3:r[41]||'', item4:r[42]||'', leadId:r[43]||'',
-      units: r[44] ? (() => { try{ return JSON.parse(r[44]); } catch(e){ return null; } })() : null
+    const sheets=getSheetsClient();
+    const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'BillsOfSale'});
+    const rows=response.data.values||[];
+    if(rows.length<=1) return res.json([]);
+    const records=rows.slice(1).map(r=>({
+      id:r[0]||'',date:r[1]||'',personalName:r[2]||'',businessName:r[3]||'',
+      address:r[4]||'',city:r[5]||'',state:r[6]||'',zip:r[7]||'',
+      bizAddress:r[8]||'',bizCity:r[9]||'',bizState:r[10]||'',bizZip:r[11]||'',
+      phone:r[12]||'',bizPhone:r[13]||'',email:r[14]||'',dlNumber:r[15]||'',dlState:r[16]||'',
+      unit:r[17]||'',year:r[18]||'',make:r[19]||'',model:r[20]||'',vin:r[21]||'',
+      miles:r[22]||'',apu:r[23]||'',color:r[24]||'',ratio:r[25]||'',hp:r[26]||'',
+      warrantyCoverage:r[27]||'',salePrice:r[28]||'',
+      serviceContractLevel:r[29]||'',serviceContractCoverage:r[30]||'',serviceContractPrice:r[31]||'',
+      salesTax:r[32]||'',titleFee:r[33]||'',docFee:r[34]||'',
+      depositAmount:r[35]||'',depositType:r[36]||'',total:r[37]||'',salesperson:r[38]||'',
+      item1:r[39]||'',item2:r[40]||'',item3:r[41]||'',item4:r[42]||'',leadId:r[43]||'',
+      units:r[44]?(()=>{try{return JSON.parse(r[44]);}catch(e){return null;}})():null
     })).reverse();
     res.json(records);
-  } catch(e) { res.status(500).json({ error:'Failed to load bills of sale' }); }
+  } catch(e){res.status(500).json({error:'Failed to load bills of sale'});}
 });
 
+// ── CLOSING PACKAGE ────────────────────────────────────────────────────────────
+
+async function generateDeliveryReceipt(d) {
+  const pdfDoc=await PDFDocument.create();
+  const fontBold=await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const font=await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const page=pdfDoc.addPage([612,792]);
+  const W=612,H=792,M=54;
+  const dt=(text,x,y,opts={})=>{try{page.drawText(String(text||''),{x,y,size:opts.size||9,font:opts.bold?fontBold:font,color:rgb(...(opts.color||[0,0,0])),maxWidth:opts.maxWidth||(W-M-x)});}catch(e){}};
+  const ln=(y,x1=M,x2=W-M,t=0.5,clr=[0.75,0.75,0.75])=>page.drawLine({start:{x:x1,y},end:{x:x2,y},thickness:t,color:rgb(...clr)});
+  const bx=(x,y,w,h,fill=[0.96,0.96,0.96])=>page.drawRectangle({x,y,width:w,height:h,color:rgb(...fill),borderColor:rgb(0.82,0.82,0.82),borderWidth:0.5});
+  try{const img=await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));const dims=img.scaleToFit(130,48);page.drawImage(img,{x:M,y:H-50-dims.height+8,width:dims.width,height:dims.height});}catch(e){}
+  const ax=W-M-175;
+  dt('Direct Truck Sales Inc.',ax,H-50,{bold:true,size:9});
+  dt('15w740 N. Frontage Rd, Ste 2',ax,H-62,{size:8});
+  dt('Burr Ridge, IL 60527',ax,H-73,{size:8});
+  dt('630-701-1000',ax,H-84,{size:8});
+  dt('Sales@Direct-Truck.com',ax,H-95,{size:8,color:[0,0.3,0.7]});
+  let y=H-118;
+  page.drawRectangle({x:M,y:y-15,width:W-M*2,height:22,color:rgb(0.12,0.12,0.12)});
+  dt('TRUCK DELIVERY RECEIPT',W/2-80,y-7,{bold:true,size:13,color:[1,1,1]});
+  y-=30;
+  bx(M,y-78,W-M*2,90);
+  dt('VEHICLE INFORMATION',M+6,y-6,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+  const half=(W-M*2)/2;
+  const vr=(label,val,x,vy,lw=52)=>{dt(label,x,vy,{bold:true,size:8.5});dt(val||'',x+lw,vy,{size:9,maxWidth:half-lw-10});ln(vy-3,x+lw,x+half-8,0.3);};
+  vr('Stock #:',d.unit||'',M+8,y-20,52); vr('Year:',d.year||'',M+8+half,y-20,38);
+  vr('Make:',d.make||'',M+8,y-36,52);   vr('Model:',d.model||'',M+8+half,y-36,38);
+  dt('VIN:',M+8,y-52,{bold:true,size:8.5});dt(d.vin||'',M+38,y-52,{size:9,maxWidth:W-M*2-50});
+  ln(y-55,M+38,W-M-8,0.3);
+  y-=96;y-=12;
+  dt('Received the above-described unit in good condition.',W/2-150,y,{bold:true,size:10});
+  y-=16;
+  page.drawText("Undersigned assumes all responsibility, risk of loss, damage, repairs and agrees to the terms and conditions outlined in the Bill of Sale and Terms and Conditions of Used Vehicle – Dealer's Warranty Disclaimer. Undersigned acknowledges the receipt of terms and conditions.",
+    {x:M,y,size:8.5,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:13});
+  y-=40;y-=10;
+  bx(M,y-68,W-M*2,80);
+  dt('PURCHASER INFORMATION',M+6,y-6,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
+  const customerName=[d.personalName,d.businessName].filter(Boolean).join(' / ');
+  vr('Date:',d.date||'',M+8,y-22,42); vr('Customer:',customerName,M+8+half,y-22,68);
+  vr('Address:',d.address||'',M+8,y-38,52);
+  dt('City/St/ZIP:',M+8,y-54,{bold:true,size:8.5});dt(`${d.city||''}, ${d.state||''} ${d.zip||''}`,M+72,y-54,{size:9,maxWidth:W-M*2-80});
+  ln(y-57,M+72,W-M-8,0.3);
+  y-=90;y-=30;
+  ln(y,M,M+220,0.8,[0,0,0]);ln(y,W-M-220,W-M,0.8,[0,0,0]);
+  dt('Customer Signature',M,y-13,{size:8,color:[0.4,0.4,0.4]});
+  dt('Direct Truck Sales Representative',W-M-220,y-13,{size:8,color:[0.4,0.4,0.4]});
+  page.drawLine({start:{x:M,y:36},end:{x:W-M,y:36},thickness:1.5,color:rgb(0.85,0.45,0.1)});
+  dt('Direct Truck Sales Inc.  |  15w740 N. Frontage Rd, Ste 2, Burr Ridge, IL 60527  |  630-701-1000',W/2-190,24,{size:7.5,color:[0.4,0.4,0.4]});
+  return await pdfDoc.save();
+}
+
+app.post('/closing/generate', requireAuth, async (req, res) => {
+  try {
+    const {formId, data:d} = req.body;
+    const isIL = ['IL','il'].includes((d.state||d.bizState||'').trim());
+    const dateParts=(d.date||'').split('-');
+    const [yr,mo,day]=dateParts.length===3?dateParts:['','',''];
+    let pdfBytes;
+
+    switch(formId) {
+      case 'rut7': {
+        const formBytes=fs.readFileSync(path.join(FORMS_DIR,'rut7.pdf'));
+        const [aA,pA,sA]=fmtPhone(d.phone);
+        const [aC,pC,sC]=fmtPhone(d.carrierPhone);
+        const leased=d.isLeased===true||d.isLeased==='true';
+        pdfBytes=await fillPdfFields(formBytes,{
+          'Purchaser Name':d.personalName||d.businessName||'',
+          'Purchaser Address':d.address||'','Purchaser City':d.city||'',
+          'Purchaser State':d.state||'','Purchaser ZIP':d.zip||'',
+          'Purchaser Phone Area Code_A':aA,'Purchaser Phone Prefix_B':pA,'Purchaser Phone Suffix_C':sA,
+          'Lease Customer name':leased?(d.carrierName||''):'',
+          'Lease Customer Address':leased?(d.carrierAddress||''):'',
+          'Lease Customer City':leased?(d.carrierCity||''):'',
+          'Lease State':leased?(d.carrierState||''):'',
+          'Lease customer Zip':leased?(d.carrierZip||''):'',
+          'Lease Customer Phone Area Code':leased?aC:'',
+          'Lease Customer Phone Prefix Code':leased?pC:'',
+          'Lease Customer Phone Suffix Code':leased?sC:'',
+          'Date of purchase - Month':mo,'Date of purchase - Day':day,'Date of purchase - Year':yr,
+          'Year, make, and model':`${d.year||''} ${d.make||''} ${d.model||''}`.trim(),
+          'Vehicle identification number':d.vin||'',
+          '6A':'/Purchases of motor vehicles and trailers ',
+          '1':true,'2':true,'USDOT No':d.usdot||'','4':true,
+          '4A':'/Authorized for hire Authorized for hire',
+          '5A':'/I certify that this purchase qualifies for the rolling stock execmption.I certify that this purchase qualifies for the rolling stock exemption.I certify that this purchase qualifies for the rolling#2',
+        });
+        break;
+      }
+      case 'dot': {
+        const formBytes=fs.readFileSync(path.join(FORMS_DIR,'dot.pdf'));
+        pdfBytes=await fillPdfFields(formBytes,{
+          'Text_1':d.reportNumber||`${yr}-${String(Date.now()).slice(-4)}`,
+          'Text_2':d.unit||'',
+          'Date_1':d.date?`${mo}/${day}/${yr}`:'',
+          'Text_7':d.vin||'',
+          'Checkbox_3':'/Checkbox_3',
+        });
+        break;
+      }
+      case 'buyers': {
+        const formBytes=fs.readFileSync(path.join(FORMS_DIR,'buyers-guide.pdf'));
+        pdfBytes=await fillPdfFields(formBytes,{
+          'topmostSubform[0].BG-AsIs[0].VehicleMake[0]':d.make||'',
+          'topmostSubform[0].BG-AsIs[0].Model[0]':d.model||'',
+          'topmostSubform[0].BG-AsIs[0].Year[0]':d.year||'',
+          'topmostSubform[0].BG-AsIs[0].VIN[0]':d.vin||'',
+          'topmostSubform[0].BG-Implied[0].VehicleMake[0]':d.make||'',
+          'topmostSubform[0].BG-Implied[0].Model[0]':d.model||'',
+          'topmostSubform[0].BG-Implied[0].Year[0]':d.year||'',
+          'topmostSubform[0].BG-Implied[0].VIN[0]':d.vin||'',
+        });
+        break;
+      }
+      case 'rt5': {
+        if(!isIL) return res.status(400).json({error:'RT-5 only required for Illinois addresses'});
+        const formBytes=fs.readFileSync(path.join(FORMS_DIR,'rt5.pdf'));
+        const pdfDoc2=await PDFDocument.load(formBytes,{ignoreEncryption:true});
+        const form2=pdfDoc2.getForm();
+        const sf=(n,v)=>{try{form2.getTextField(n).setText(String(v||''));}catch(e){}};
+        sf('Name of individual',agentLine(d.personalName,d.businessName));
+        sf('Whose address is: 1',[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '));
+        sf('Vehicle make',d.make||'');sf('Vehicle model year',d.year||'');
+        sf('Vehicle model',d.model||'');sf('Vehicle body type','Truck');sf('VIN #',d.vin||'');
+        form2.flatten();
+        pdfBytes=await pdfDoc2.save();
+        break;
+      }
+      case 'lpoa': {
+        if(!isIL) return res.status(400).json({error:'LPOA only required for Illinois addresses'});
+        const formBytes=fs.readFileSync(path.join(FORMS_DIR,'lpoa.pdf'));
+        const pdfDoc3=await PDFDocument.load(formBytes,{ignoreEncryption:true});
+        const hv=await pdfDoc3.embedFont(StandardFonts.Helvetica);
+        const pg3=pdfDoc3.getPages()[0];
+        for(const f of [
+          {text:d.personalName||d.businessName||'',x:182,y:726,size:11},
+          {text:'Owner',x:22,y:691,size:10},
+          {text:d.businessName||'',x:230,y:691,size:10},
+          {text:[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '),x:91,y:656,size:10},
+        ]){pg3.drawText(String(f.text||''),{x:f.x,y:f.y,size:f.size,font:hv,color:rgb(0,0,0),maxWidth:350});}
+        pdfBytes=await pdfDoc3.save();
+        break;
+      }
+      case 'receipt': {
+        pdfBytes=await generateDeliveryReceipt(d);
+        break;
+      }
+      default: return res.status(400).json({error:'Unknown form: '+formId});
+    }
+
+    const safeName=(d.personalName||d.businessName||'closing').replace(/[^a-zA-Z0-9]/g,'_');
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="${formId}_${safeName}.pdf"`});
+    res.send(Buffer.from(pdfBytes));
+  } catch(e){ console.error('Closing form error:',e); res.status(500).json({error:'Form generation failed: '+e.message}); }
+});
+
+app.post('/closing/generate-all', requireAuth, async (req, res) => {
+  try {
+    const {data:d}=req.body;
+    const isIL=['IL','il'].includes((d.state||d.bizState||'').trim());
+    const forms=['rut7','dot','buyers','receipt'];
+    if(isIL){forms.push('rt5');forms.push('lpoa');}
+    const merged=await PDFDocument.create();
+    for(const formId of forms){
+      try{
+        const genResp=await fetch(`http://localhost:${process.env.PORT||3000}/closing/generate`,{
+          method:'POST',headers:{'Content-Type':'application/json','Authorization':req.headers.authorization},
+          body:JSON.stringify({formId,data:d})
+        });
+        if(!genResp.ok){console.warn(`Skipping ${formId}`);continue;}
+        const srcBytes=Buffer.from(await genResp.arrayBuffer());
+        const srcDoc=await PDFDocument.load(srcBytes,{ignoreEncryption:true});
+        const pages=await merged.copyPages(srcDoc,srcDoc.getPageIndices());
+        pages.forEach(p=>merged.addPage(p));
+      }catch(e){console.warn(`Error generating ${formId}:`,e.message);}
+    }
+    const mergedBytes=await merged.save();
+    const safeName=(d.personalName||d.businessName||'closing').replace(/[^a-zA-Z0-9]/g,'_');
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="ClosingPackage_${safeName}.pdf"`});
+    res.send(Buffer.from(mergedBytes));
+  }catch(e){console.error('Generate all error:',e);res.status(500).json({error:'Failed to generate package: '+e.message});}
+});
+
+app.post('/closing/save', requireAuth, async (req, res) => {
+  try {
+    const sheets=getSheetsClient(); const d=req.body; const SHEET='ClosingPackages';
+    let hasHeader=false;
+    try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
+    if(!hasHeader){
+      await sheets.spreadsheets.values.update({spreadsheetId:SHEET_ID,range:`${SHEET}!A1`,valueInputOption:'RAW',
+        requestBody:{values:[['ID','Date','Customer Name','Business Name','Address','City','State','Zip','Phone',
+          'Unit','Year','Make','Model','VIN','Salesperson','USDOT','MC Number','Is Leased',
+          'Carrier Name','Carrier Address','Carrier City','Carrier State','Carrier Zip','Carrier Phone',
+          'BOS ID','Notes']]}});
+    }
+    const id='CP'+Date.now();
+    await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID,range:SHEET,valueInputOption:'RAW',insertDataOption:'INSERT_ROWS',
+      requestBody:{values:[[id,d.date||new Date().toISOString().split('T')[0],
+        d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',d.phone||'',
+        d.unit||'',d.year||'',d.make||'',d.model||'',d.vin||'',d.salesperson||'',
+        d.usdot||'',d.mcNumber||'',d.isLeased?'Yes':'No',
+        d.carrierName||'',d.carrierAddress||'',d.carrierCity||'',d.carrierState||'',d.carrierZip||'',d.carrierPhone||'',
+        d.bosId||'',d.notes||'']]}});
+    res.json({success:true,id});
+  }catch(e){console.error(e);res.status(500).json({error:'Failed to save closing package'});}
+});
+
+app.get('/closing', requireAuth, async (req, res) => {
+  try {
+    const sheets=getSheetsClient();
+    const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'ClosingPackages'});
+    const rows=response.data.values||[];
+    if(rows.length<=1) return res.json([]);
+    const records=rows.slice(1).map(r=>({
+      id:r[0]||'',date:r[1]||'',personalName:r[2]||'',businessName:r[3]||'',
+      address:r[4]||'',city:r[5]||'',state:r[6]||'',zip:r[7]||'',phone:r[8]||'',
+      unit:r[9]||'',year:r[10]||'',make:r[11]||'',model:r[12]||'',vin:r[13]||'',
+      salesperson:r[14]||'',usdot:r[15]||'',mcNumber:r[16]||'',isLeased:r[17]==='Yes',
+      carrierName:r[18]||'',carrierAddress:r[19]||'',carrierCity:r[20]||'',
+      carrierState:r[21]||'',carrierZip:r[22]||'',carrierPhone:r[23]||'',
+      bosId:r[24]||'',notes:r[25]||''
+    })).reverse();
+    res.json(records);
+  }catch(e){res.status(500).json({error:'Failed to load closing packages'});}
+});
 
 // ── START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
