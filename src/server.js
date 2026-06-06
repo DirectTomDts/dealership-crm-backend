@@ -352,57 +352,79 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     row(p1,y,'Phone:',d.phone,'Phone:',(d.bizPhone||d.phone)); y-=13;
     row(p1,y,'Email:',d.email,'DL # / State:',`${d.dlNumber||''} ${d.dlState?'('+d.dlState+')':''}`); y-=18;
 
-    // Units loop — each unit gets its own section box
+    // Units loop — each unit gets its own full-width section (vehicle LEFT, financials RIGHT, same row)
     for(let ui=0;ui<units.length;ui++){
       const u=units[ui];
-      const hasItems=[u.item1,u.item2,u.item3,u.item4].filter(Boolean).length>0;
-      // Check if we need a new page
-      if(y < 280){ const np=pdfDoc.addPage([W,H]); y=await addHeader(np,`BILL OF SALE — Unit ${ui+1} (cont.)`); }
 
-      // Vehicle box
-      const vBoxH = 70;
-      box(p1,M,y-vBoxH,W-M*2,vBoxH+12);
-      dt(p1,units.length>1?`VEHICLE — UNIT ${ui+1}`:' VEHICLE',M+6,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
-      y-=16;
-      // Row 1: Year Make Model VIN Unit#
-      const vc=[{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit #:',v:u.unit||''}];
-      const vcX=[M+6,M+76,M+168,M+272,M+440]; const vcW=[32,34,32,28,36];
-      vc.forEach((f,i)=>{ dt(p1,f.l,vcX[i],y,{bold:true,size:7.5}); dt(p1,f.v,vcX[i]+vcW[i],y,{size:8.5,maxWidth:i===3?155:85}); });
-      y-=14;
-      // Row 2: options
-      let ox=M+6;
-      [['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]].forEach(([k,v])=>{
-        if(v){dt(p1,k+':',ox,y,{bold:true,size:7.5}); dt(p1,String(v),ox+34,y,{size:8,maxWidth:65}); ox+=100;}
-      });
-      y-=14;
-      // Warranty + SC
-      dt(p1,'Warranty:',M+6,y,{bold:true,size:8.5}); dt(p1,u.warrantyCoverage||'AS-IS',M+58,y,{size:8.5,maxWidth:150});
-      if(u.serviceContractLevel){
-        dt(p1,'Service Contract:',W/2+6,y,{bold:true,size:8.5});
-        dt(p1,`${u.serviceContractLevel} — ${u.serviceContractCoverage||''}`,W/2+106,y,{size:8.5,maxWidth:155});
-      }
-      y-=20;
+      // Estimate space needed: vehicle box ~90px + warranty row + gap
+      const neededHeight = 110;
+      if(y < neededHeight + 80){ const np=pdfDoc.addPage([W,H]); y=await addHeader(np,`BILL OF SALE — Unit ${ui+1} (cont.)`); }
 
-      // Financial summary for this unit — right-side box
-      const finX=W/2+10, finW=W-M-finX;
+      // --- Calculate financial rows first so we know height ---
       const finItems=[
-        ['Sale Price:',    fmtM(u.salePrice)],
-        ['Service Contr.:',u.serviceContractPrice&&parseFloat(u.serviceContractPrice)>0?fmtM(u.serviceContractPrice):null],
-        ['Sales Tax:',     u.salesTax&&parseFloat(u.salesTax)>0?fmtM(u.salesTax):null],
-        ['IL Title Fee:',  u.titleFee&&parseFloat(u.titleFee)>0?fmtM(u.titleFee):null],
-        ['Doc Fee:',       fmtM(u.docFee||350)],
+        ['Sale Price:',      fmtM(u.salePrice)],
+        ['Service Contract:',u.serviceContractPrice&&parseFloat(u.serviceContractPrice)>0?fmtM(u.serviceContractPrice):null],
+        ['Sales Tax:',       u.salesTax&&parseFloat(u.salesTax)>0?fmtM(u.salesTax):null],
+        ['IL Title Fee:',    u.titleFee&&parseFloat(u.titleFee)>0?fmtM(u.titleFee):null],
+        ['Doc Fee:',         fmtM(u.docFee||350)],
       ].filter(r=>r[1]);
-      const finH = finItems.length*15+30;
-      box(p1,finX-6,y-finH,finW+10,finH+12);
-      dt(p1,units.length>1?`FINANCIALS — UNIT ${ui+1}`:'FINANCIAL SUMMARY',finX,y-5,{bold:true,size:7.5,color:[0.4,0.4,0.4]});
-      let fy=y-18;
-      finItems.forEach(([lbl,val])=>{
-        dt(p1,lbl,finX+2,fy,{bold:true,size:8.5,maxWidth:90});
-        const vw=(val||'').length*5.4; dt(p1,val||'',W-M-4-vw,fy,{size:8.5,maxWidth:90});
-        p1.drawLine({start:{x:finX,y:fy-3},end:{x:W-M,y:fy-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
-        fy-=15;
+
+      // Heights
+      const vehicleRows = 3; // header + 2 data rows
+      const vH = vehicleRows * 15 + 20 + 16; // ~81px
+      const fH = finItems.length * 15 + 22;
+      const sectionH = Math.max(vH, fH) + 8;
+
+      // Draw section background
+      const topY = y;
+      box(p1, M, topY - sectionH, W-M*2, sectionH + 12, [0.97,0.97,0.97]);
+
+      // --- LEFT SIDE: Vehicle info (full width to W/2) ---
+      const vLabel = units.length > 1 ? `VEHICLE — UNIT ${ui+1}` : 'VEHICLE';
+      dt(p1, vLabel, M+6, topY-5, {bold:true, size:7.5, color:[0.4,0.4,0.4]});
+
+      let vy = topY - 18;
+      // Row 1: Year / Make / Model / VIN / Unit#  (left half only)
+      const vcX=[M+6,M+60,M+130,M+210,M+360];
+      const vcW=[30,  30,  26,   140,   34];
+      [{l:'Year:',v:u.year||''},{l:'Make:',v:u.make||''},{l:'Model:',v:u.model||''},{l:'VIN:',v:u.vin||''},{l:'Unit#:',v:u.unit||''}]
+        .forEach((f,i)=>{ dt(p1,f.l,vcX[i],vy,{bold:true,size:7.5}); dt(p1,f.v,vcX[i]+vcW[i],vy,{size:8.5,maxWidth:vcW[i]+14}); });
+      vy -= 13;
+
+      // Row 2: Miles / APU / Color / Ratio / HP
+      let ox = M+6;
+      [['Miles',u.miles],['APU',u.apu],['Color',u.color],['Ratio',u.ratio],['HP',u.hp]].forEach(([k,v])=>{
+        if(v){ dt(p1,k+':',ox,vy,{bold:true,size:7.5}); dt(p1,String(v),ox+30,vy,{size:8,maxWidth:58}); ox+=92; }
       });
-      y-=finH+16;
+      vy -= 13;
+
+      // Row 3: Warranty + Service contract (left half only)
+      dt(p1,'Warranty:',M+6,vy,{bold:true,size:8}); dt(p1,u.warrantyCoverage||'AS-IS',M+56,vy,{size:8,maxWidth:140});
+      if(u.serviceContractLevel){
+        dt(p1,'SC:',M+6,vy-13,{bold:true,size:7.5});
+        dt(p1,`${u.serviceContractLevel} — ${u.serviceContractCoverage||''}`,M+24,vy-13,{size:7.5,maxWidth:200});
+        vy -= 13;
+      }
+
+      // --- RIGHT SIDE: Financial summary box ---
+      const finX = W/2 + 6;
+      const finW = W - M - finX;
+      // Draw a separator line between left and right
+      p1.drawLine({start:{x:W/2,y:topY-4},end:{x:W/2,y:topY-sectionH+2},thickness:0.5,color:rgb(0.8,0.8,0.8)});
+
+      const finLabel = units.length > 1 ? `FINANCIALS — UNIT ${ui+1}` : 'FINANCIAL SUMMARY';
+      dt(p1, finLabel, finX, topY-5, {bold:true, size:7.5, color:[0.4,0.4,0.4]});
+
+      let fy = topY - 18;
+      finItems.forEach(([lbl,val])=>{
+        dt(p1, lbl, finX, fy, {bold:true, size:8, maxWidth:90});
+        const vw = (val||'').length * 5.2;
+        dt(p1, val||'', W-M-4-vw, fy, {size:8.5, maxWidth:90});
+        p1.drawLine({start:{x:finX,y:fy-3},end:{x:W-M,y:fy-3},thickness:0.3,color:rgb(0.88,0.88,0.88)});
+        fy -= 15;
+      });
+
+      y -= sectionH + 12;
     }
 
     // Deposit + Grand total
@@ -481,12 +503,19 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
       yw-=20;
       pw.drawText('The purchaser will be responsible for work performed if the sale is terminated. Work completed once fully funded. Once started, deposits are non-refundable.',
         {x:M,y:yw,size:8,font,color:rgb(0.2,0.2,0.2),maxWidth:W-M*2,lineHeight:12});
-      yw-=40; ln(pw,yw+8);
-      dt(pw,'Purchaser:',M,yw-7,{bold:true,size:9}); dt(pw,'_________________________________',M+70,yw-7,{size:9});
-      dt(pw,'Date:',M+322,yw-7,{bold:true,size:9}); dt(pw,'__________',M+348,yw-7,{size:9});
-      yw-=20;
-      dt(pw,'Direct Truck Sales:',M,yw-7,{bold:true,size:9}); dt(pw,'_________________________________',M+122,yw-7,{size:9});
-      dt(pw,'Date:',M+374,yw-7,{bold:true,size:9}); dt(pw,'__________',M+400,yw-7,{size:9});
+      yw-=40;
+      pw.drawLine({start:{x:M,y:yw+8},end:{x:W-M,y:yw+8},thickness:0.5,color:rgb(0.75,0.75,0.75)});
+      // Purchaser signature row
+      dt(pw,'Purchaser Signature:',M,yw-7,{bold:true,size:9});
+      dt(pw,'______________________________',M+128,yw-7,{size:9});
+      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});
+      dt(pw,'________________',W/2+58,yw-7,{size:9});
+      yw-=24;
+      // DTS signature row
+      dt(pw,'Direct Truck Sales:',M,yw-7,{bold:true,size:9});
+      dt(pw,'______________________________',M+128,yw-7,{size:9});
+      dt(pw,'Date:',W/2+30,yw-7,{bold:true,size:9});
+      dt(pw,'________________',W/2+58,yw-7,{size:9});
     }
 
     const pdfBytes=await pdfDoc.save();
@@ -511,17 +540,37 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
     if (!hasHeader) {
       await sheets.spreadsheets.values.update({
         spreadsheetId:SHEET_ID, range:`${BOS_SHEET}!A1`, valueInputOption:'RAW',
-        requestBody:{ values:[['ID','Date','Personal Name','Business Name','Address','City','State','Zip','Phone','Email','DL#','DL State','Unit','Year','Make','Model','VIN','Miles','APU','Color','Ratio','HP','Warranty','Sale Price','SC Level','SC Coverage','SC Price','Sales Tax','Title Fee','Doc Fee','Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID']] }
+        requestBody:{ values:[['ID','Date','Personal Name','Business Name','Address','City','State','Zip',
+          'Biz Address','Biz City','Biz State','Biz Zip','Phone','Biz Phone','Email','DL#','DL State',
+          'Unit','Year','Make','Model','VIN','Miles','APU','Color','Ratio','HP',
+          'Warranty','Sale Price','SC Level','SC Coverage','SC Price','Sales Tax','Title Fee','Doc Fee',
+          'Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID','Units JSON']] }
       });
     }
     const id = d.id || 'BOS'+Date.now();
     await sheets.spreadsheets.values.append({
       spreadsheetId:SHEET_ID, range:BOS_SHEET, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
-      requestBody:{ values:[[id,d.date||new Date().toISOString().split('T')[0],d.personalName,d.businessName,d.address,d.city,d.state,d.zip,d.phone,d.email,d.dlNumber,d.dlState,d.unit,d.year,d.make,d.model,d.vin,d.miles,d.apu,d.color,d.ratio,d.hp,d.warrantyCoverage,d.salePrice,d.serviceContractLevel,d.serviceContractCoverage,d.serviceContractPrice,d.salesTax,d.titleFee,d.docFee,d.depositAmount,d.depositType,d.total,d.salesperson,d.item1||'',d.item2||'',d.item3||'',d.item4||'',d.leadId||'']] }
+      requestBody:{ values:[[
+        id, d.date||new Date().toISOString().split('T')[0],
+        d.personalName||'', d.businessName||'',
+        d.address||'', d.city||'', d.state||'', d.zip||'',
+        d.bizAddress||'', d.bizCity||'', d.bizState||'', d.bizZip||'',
+        d.phone||'', d.bizPhone||'', d.email||'', d.dlNumber||'', d.dlState||'',
+        d.unit||'', d.year||'', d.make||'', d.model||'', d.vin||'',
+        d.miles||'', d.apu||'', d.color||'', d.ratio||'', d.hp||'',
+        d.warrantyCoverage||'', d.salePrice||'',
+        d.serviceContractLevel||'', d.serviceContractCoverage||'', d.serviceContractPrice||'',
+        d.salesTax||'', d.titleFee||'', d.docFee||350,
+        d.depositAmount||'', d.depositType||'', d.total||'', d.salesperson||'',
+        d.item1||'', d.item2||'', d.item3||'', d.item4||'',
+        d.leadId||'',
+        d.units ? JSON.stringify(d.units) : ''
+      ]] }
     });
     res.json({ success:true, id });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save bill of sale' }); }
 });
+
 
 // ── BILL OF SALE — LIST ────────────────────────────────────────────────────────
 app.get('/billsofsale', requireAuth, async (req, res) => {
@@ -531,20 +580,23 @@ app.get('/billsofsale', requireAuth, async (req, res) => {
     const rows = response.data.values || [];
     if (rows.length <= 1) return res.json([]);
     const records = rows.slice(1).map(r => ({
-      id:r[0]||'',date:r[1]||'',personalName:r[2]||'',businessName:r[3]||'',
-      address:r[4]||'',city:r[5]||'',state:r[6]||'',zip:r[7]||'',
-      phone:r[8]||'',email:r[9]||'',dlNumber:r[10]||'',dlState:r[11]||'',
-      unit:r[12]||'',year:r[13]||'',make:r[14]||'',model:r[15]||'',vin:r[16]||'',
-      miles:r[17]||'',apu:r[18]||'',color:r[19]||'',ratio:r[20]||'',hp:r[21]||'',
-      warrantyCoverage:r[22]||'',salePrice:r[23]||'',
-      serviceContractLevel:r[24]||'',serviceContractCoverage:r[25]||'',serviceContractPrice:r[26]||'',
-      salesTax:r[27]||'',titleFee:r[28]||'',docFee:r[29]||'',
-      depositAmount:r[30]||'',depositType:r[31]||'',total:r[32]||'',salesperson:r[33]||'',
-      item1:r[34]||'',item2:r[35]||'',item3:r[36]||'',item4:r[37]||'',leadId:r[38]||''
+      id:r[0]||'', date:r[1]||'', personalName:r[2]||'', businessName:r[3]||'',
+      address:r[4]||'', city:r[5]||'', state:r[6]||'', zip:r[7]||'',
+      bizAddress:r[8]||'', bizCity:r[9]||'', bizState:r[10]||'', bizZip:r[11]||'',
+      phone:r[12]||'', bizPhone:r[13]||'', email:r[14]||'', dlNumber:r[15]||'', dlState:r[16]||'',
+      unit:r[17]||'', year:r[18]||'', make:r[19]||'', model:r[20]||'', vin:r[21]||'',
+      miles:r[22]||'', apu:r[23]||'', color:r[24]||'', ratio:r[25]||'', hp:r[26]||'',
+      warrantyCoverage:r[27]||'', salePrice:r[28]||'',
+      serviceContractLevel:r[29]||'', serviceContractCoverage:r[30]||'', serviceContractPrice:r[31]||'',
+      salesTax:r[32]||'', titleFee:r[33]||'', docFee:r[34]||'',
+      depositAmount:r[35]||'', depositType:r[36]||'', total:r[37]||'', salesperson:r[38]||'',
+      item1:r[39]||'', item2:r[40]||'', item3:r[41]||'', item4:r[42]||'', leadId:r[43]||'',
+      units: r[44] ? (() => { try{ return JSON.parse(r[44]); } catch(e){ return null; } })() : null
     })).reverse();
     res.json(records);
   } catch(e) { res.status(500).json({ error:'Failed to load bills of sale' }); }
 });
+
 
 // ── START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
