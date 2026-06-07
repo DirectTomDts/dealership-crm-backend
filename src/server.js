@@ -655,16 +655,34 @@ app.post('/closing/generate', requireAuth, async (req, res) => {
       }
       case 'rt5': {
         if(!isIL) return res.status(400).json({error:'RT-5 only required for Illinois addresses'});
+        // Overlay approach: DA string empty so fillable fields auto-scale huge. Overlay text instead.
         const formBytes=fs.readFileSync(path.join(FORMS_DIR,'rt5.pdf'));
-        const pdfDoc2=await PDFDocument.load(formBytes,{ignoreEncryption:true});
-        const form2=pdfDoc2.getForm();
-        const sf=(n,v)=>{try{form2.getTextField(n).setText(String(v||''));}catch(e){}};
-        sf('Name of individual',agentLine(d.personalName,d.businessName));
-        sf('Whose address is: 1',[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '));
-        sf('Vehicle make',d.make||'');sf('Vehicle model year',d.year||'');
-        sf('Vehicle model',d.model||'');sf('Vehicle body type','Truck');sf('VIN #',d.vin||'');
-        form2.flatten();
-        pdfBytes=await pdfDoc2.save();
+        const role = d.role || 'agent';
+        const nameLine = d.businessName
+          ? `${d.personalName||d.businessName}, ${role} for ${d.businessName}`
+          : (d.personalName||'');
+        const addrLine = [d.address,d.city,d.state,d.zip].filter(Boolean).join(', ');
+        // Create text overlay at exact field rect positions (extracted from blank RT5)
+        const overlayDoc = await PDFDocument.create();
+        const overlayPage = overlayDoc.addPage([612, 792]);
+        const hvRT5 = await overlayDoc.embedFont(StandardFonts.Helvetica);
+        for(const f of [
+          {text:nameLine,    x:38,  y:574, size:9.5, maxW:530},
+          {text:addrLine,    x:134, y:540, size:9,   maxW:435},
+          {text:d.make||'',  x:110, y:426, size:9,   maxW:172},
+          {text:d.year||'',  x:354, y:427, size:9,   maxW:210},
+          {text:d.model||'', x:116, y:399, size:9,   maxW:200},
+          {text:'Truck',     x:387, y:399, size:9,   maxW:180},
+          {text:d.vin||'',   x:220, y:373, size:9,   maxW:345},
+        ]){
+          overlayPage.drawText(String(f.text||''),{x:f.x,y:f.y,size:f.size,font:hvRT5,color:rgb(0,0,0),maxWidth:f.maxW});
+        }
+        const overlayBytes = await overlayDoc.save();
+        // Merge overlay onto original RT5 (keeps B&B pre-filled text intact)
+        const baseDocRT5 = await PDFDocument.load(formBytes,{ignoreEncryption:true});
+        const [embeddedOverlay] = await baseDocRT5.embedPdf(await PDFDocument.load(overlayBytes),[0]);
+        baseDocRT5.getPages()[0].drawPage(embeddedOverlay);
+        pdfBytes = await baseDocRT5.save();
         break;
       }
       case 'lpoa': {
@@ -679,7 +697,7 @@ app.post('/closing/generate', requireAuth, async (req, res) => {
         // Address moved up slightly
         for(const f of [
           {text:d.personalName||d.businessName||'', x:182, y:726, size:9,   maxW:380},
-          {text:'President',                         x:58,  y:692, size:8.5, maxW:110},
+          {text:d.role||'President',                 x:58,  y:692, size:8.5, maxW:110},
           {text:d.businessName||'',                  x:240, y:692, size:8.5, maxW:325},
           {text:[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '), x:91, y:662, size:8.5, maxW:490},
         ]){pg3.drawText(String(f.text||''),{x:f.x,y:f.y,size:f.size||9,font:hv,color:rgb(0,0,0),maxWidth:f.maxW||350});}
@@ -736,7 +754,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
         requestBody:{values:[['ID','Date','Customer Name','Business Name','Address','City','State','Zip','Phone',
           'Unit','Year','Make','Model','VIN','Salesperson','USDOT','MC Number','Is Leased',
           'Carrier Name','Carrier Address','Carrier City','Carrier State','Carrier Zip','Carrier Phone',
-          'BOS ID','Notes']]}});
+          'Role','Role','BOS ID','Notes']]}});
     }
     const id='CP'+Date.now();
     await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID,range:SHEET,valueInputOption:'RAW',insertDataOption:'INSERT_ROWS',
@@ -745,7 +763,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
         d.unit||'',d.year||'',d.make||'',d.model||'',d.vin||'',d.salesperson||'',
         d.usdot||'',d.mcNumber||'',d.isLeased?'Yes':'No',
         d.carrierName||'',d.carrierAddress||'',d.carrierCity||'',d.carrierState||'',d.carrierZip||'',d.carrierPhone||'',
-        d.bosId||'',d.notes||'']]}});
+        d.role||'agent',d.bosId||'',d.notes||'']]}});
     res.json({success:true,id});
   }catch(e){console.error(e);res.status(500).json({error:'Failed to save closing package'});}
 });
@@ -763,7 +781,7 @@ app.get('/closing', requireAuth, async (req, res) => {
       salesperson:r[14]||'',usdot:r[15]||'',mcNumber:r[16]||'',isLeased:r[17]==='Yes',
       carrierName:r[18]||'',carrierAddress:r[19]||'',carrierCity:r[20]||'',
       carrierState:r[21]||'',carrierZip:r[22]||'',carrierPhone:r[23]||'',
-      bosId:r[24]||'',notes:r[25]||''
+      role:r[24]||'agent',bosId:r[25]||'',notes:r[26]||''
     })).reverse();
     res.json(records);
   }catch(e){res.status(500).json({error:'Failed to load closing packages'});}
