@@ -673,12 +673,16 @@ app.post('/closing/generate', requireAuth, async (req, res) => {
         const pdfDoc3=await PDFDocument.load(formBytes,{ignoreEncryption:true});
         const hv=await pdfDoc3.embedFont(StandardFonts.Helvetica);
         const pg3=pdfDoc3.getPages()[0];
+        // Name line - smaller font, full width
+        // Title row: "President" moved right to clear the "Title" underline label
+        // Company name after ", of" gap
+        // Address moved up slightly
         for(const f of [
-          {text:d.personalName||d.businessName||'',x:182,y:726,size:11},
-          {text:'Owner',x:22,y:691,size:10},
-          {text:d.businessName||'',x:230,y:691,size:10},
-          {text:[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '),x:91,y:656,size:10},
-        ]){pg3.drawText(String(f.text||''),{x:f.x,y:f.y,size:f.size,font:hv,color:rgb(0,0,0),maxWidth:350});}
+          {text:d.personalName||d.businessName||'', x:182, y:726, size:9,   maxW:380},
+          {text:'President',                         x:58,  y:692, size:8.5, maxW:110},
+          {text:d.businessName||'',                  x:240, y:692, size:8.5, maxW:325},
+          {text:[d.address,d.city,d.state,d.zip].filter(Boolean).join(', '), x:91, y:662, size:8.5, maxW:490},
+        ]){pg3.drawText(String(f.text||''),{x:f.x,y:f.y,size:f.size||9,font:hv,color:rgb(0,0,0),maxWidth:f.maxW||350});}
         pdfBytes=await pdfDoc3.save();
         break;
       }
