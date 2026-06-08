@@ -37,6 +37,7 @@ const USERS = [
   { username:'don',     password: process.env.PASS_DON     || 'Don2024!',     name:'Don',     role:'sales' },
   { username:'vitalie', password: process.env.PASS_VITALIE || 'Vitalie2024!', name:'Vitalie', role:'sales' },
   { username:'tom',     password: process.env.PASS_TOM     || 'Tom2024!',     name:'Tom',     role:'admin' },
+  { username:'olia',    password: process.env.PASS_OLIA    || 'Olia2024!',    name:'Olia',    role:'sales' },
 ];
 if (!process.env.PASS_DON) console.warn('WARNING: PASS_DON not set in env — using default password. Update in Railway.');
 if (!process.env.PASS_TOM) console.warn('WARNING: PASS_TOM not set in env — using default password. Update in Railway.');
