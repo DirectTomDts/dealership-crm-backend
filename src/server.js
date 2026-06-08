@@ -7,20 +7,32 @@ const { google } = require('googleapis');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(o=>o.trim()).filter(Boolean);
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // ── CONFIG ─────────────────────────────────────────────────────────────────────
-const JWT_SECRET   = process.env.JWT_SECRET || 'change-this-secret';
+const JWT_SECRET   = process.env.JWT_SECRET;
+if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET env var not set'); process.exit(1); }
 const SHEET_ID     = process.env.SHEET_ID;
 const SHEET_NAME   = process.env.SHEET_NAME || 'Sheet1';
 const INV_SHEET_ID = '1_R2mmi6O_KQW1mSd1Nu26fJDwrXKtRwH9vTwGnA2fN4';
 const FORMS_DIR    = path.join(__dirname, '..', 'forms');
 
 const USERS = [
-  { username:'don',     password: process.env.PASS_DON     || 'Don2024!',     name:'Don',     role:'sales' },
-  { username:'vitalie', password: process.env.PASS_VITALIE || 'Vitalie2024!', name:'Vitalie', role:'sales' },
-  { username:'tom',     password: process.env.PASS_TOM     || 'Tom2024!',     name:'Tom',     role:'admin' },
+  { username:'don',     password: process.env.PASS_DON,     name:'Don',     role:'sales' },
+  { username:'vitalie', password: process.env.PASS_VITALIE, name:'Vitalie', role:'sales' },
+  { username:'tom',     password: process.env.PASS_TOM,     name:'Tom',     role:'admin' },
 ];
 
 // ── LOGO (embedded) ────────────────────────────────────────────────────────────
@@ -113,13 +125,50 @@ async function fillPdfFields(formBytes, fieldMap) {
   return await pdfDoc.save();
 }
 
+
+// ── RATE LIMITER (login brute-force protection) ────────────────────────────────
+const loginAttempts = new Map();
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const record = loginAttempts.get(ip) || { count: 0, resetAt: now + 15 * 60 * 1000 };
+  if (now > record.resetAt) { record.count = 0; record.resetAt = now + 15 * 60 * 1000; }
+  record.count++;
+  loginAttempts.set(ip, record);
+  return record.count > 10; // block after 10 attempts per 15 min
+}
+// Clean up old entries every hour
+setInterval(() => { const now = Date.now(); loginAttempts.forEach((v,k) => { if (now > v.resetAt) loginAttempts.delete(k); }); }, 3600000);
+
+
+// ── INPUT SANITIZER (prevent spreadsheet formula injection) ───────────────────
+function sanitize(val) {
+  if (typeof val !== 'string') return val;
+  // Strip leading characters that trigger spreadsheet formulas
+  const trimmed = val.trim();
+  if (['=','@','+','-','|','%'].includes(trimmed[0])) return "'" + trimmed;
+  return trimmed;
+}
+function sanitizeObj(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const clean = {};
+  for (const [k, v] of Object.entries(obj)) {
+    clean[k] = typeof v === 'string' ? sanitize(v) : (Array.isArray(v) ? v : sanitizeObj(v));
+  }
+  return clean;
+}
+
 // ── HEALTH ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status:'Dealer CRM API running' }));
 
 // ── AUTH ───────────────────────────────────────────────────────────────────────
 app.post('/auth/login', (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many login attempts. Try again in 15 minutes.' });
+  }
   const { username, password } = req.body;
-  const user = USERS.find(u => u.username === username.toLowerCase() && u.password === password);
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  const user = USERS.find(u => u.username === (username||'').toLowerCase() && u.password === password);
   if (!user) return res.status(401).json({ error:'Invalid username or password' });
   const token = jwt.sign({ username:user.username, name:user.name, role:user.role }, JWT_SECRET, { expiresIn:'12h' });
   res.json({ token, name:user.name, role:user.role });
@@ -147,7 +196,7 @@ app.get('/leads', requireAuth, async (req, res) => {
 app.post('/leads', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
-    const l = req.body;
+    const l = sanitizeObj(req.body);
     const id = 'L'+Date.now();
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
     await sheets.spreadsheets.values.append({
@@ -161,7 +210,7 @@ app.post('/leads', requireAuth, async (req, res) => {
 app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
-    const l = req.body;
+    const l = sanitizeObj(req.body);
     const sheetRow = parseInt(req.params.rowIndex)+1;
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
     await sheets.spreadsheets.values.update({
@@ -486,7 +535,7 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
   try {
-    const sheets=getSheetsClient(); const d=req.body; const BOS_SHEET='BillsOfSale';
+    const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const BOS_SHEET='BillsOfSale';
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
@@ -746,7 +795,7 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
 
 app.post('/closing/save', requireAuth, async (req, res) => {
   try {
-    const sheets=getSheetsClient(); const d=req.body; const SHEET='ClosingPackages';
+    const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const SHEET='ClosingPackages';
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
