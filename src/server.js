@@ -195,6 +195,10 @@ app.get('/leads', requireAuth, async (req, res) => {
       rowIndex:i+1, id:r[0]||'', first:r[1]||'', last:r[2]||'', company:r[3]||'',
       phone:r[4]||'', email:r[5]||'', unit:r[6]||'', source:r[7]||'',
       status:r[8]||'Prospect', sales:r[9]||'', followup:r[10]||'', notes:r[11]||'', archived:r[12]||'false',
+      address:r[13]||'', city:r[14]||'', state:r[15]||'', zip:r[16]||'',
+      bizAddress:r[17]||'', bizCity:r[18]||'', bizState:r[19]||'', bizZip:r[20]||'', bizPhone:r[21]||'',
+      dlNumber:r[22]||'', dlState:r[23]||'',
+      deals:(()=>{ try{ return r[24]?JSON.parse(r[24]):[]; }catch(e){ return []; } })(),
     }));
     res.json(leads);
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load leads' }); }
@@ -208,7 +212,10 @@ app.post('/leads', requireAuth, async (req, res) => {
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
     await sheets.spreadsheets.values.append({
       spreadsheetId:SHEET_ID, range:SHEET_NAME, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
-      requestBody:{ values:[[id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived]] }
+      requestBody:{ values:[[id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
+        l.address||'',l.city||'',l.state||'',l.zip||'',
+        l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
+        l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
     });
     res.json({ success:true, id });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save lead' }); }
@@ -221,11 +228,78 @@ app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
     const sheetRow = parseInt(req.params.rowIndex)+1;
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
     await sheets.spreadsheets.values.update({
-      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:M${sheetRow}`, valueInputOption:'RAW',
-      requestBody:{ values:[[l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived]] }
+      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:Y${sheetRow}`, valueInputOption:'RAW',
+      requestBody:{ values:[[l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
+        l.address||'',l.city||'',l.state||'',l.zip||'',
+        l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
+        l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
     });
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to update lead' }); }
+});
+
+
+
+// ── SHEET TAB AUTO-CREATE ──────────────────────────────────────────────────────
+async function ensureSheetTab(sheets, tabName) {
+  try {
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+    const exists = (meta.data.sheets||[]).some(s => s.properties.title === tabName);
+    if (!exists) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: { requests: [{ addSheet: { properties: { title: tabName } } }] }
+      });
+      console.log('Created missing sheet tab:', tabName);
+    }
+  } catch(e) { console.warn('ensureSheetTab', tabName, e.message); }
+}
+
+// ── LEAD ENRICHMENT: store client + deal info on the lead ─────────────────────
+app.post('/leads/enrich', requireAuth, async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const { leadId, client, deal } = sanitizeObj(req.body);
+    if (!leadId) return res.status(400).json({ error:'leadId required' });
+
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:SHEET_NAME });
+    const rows = response.data.values || [];
+    let rowNum = -1, row = null;
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0]||'') === leadId) { rowNum = i + 1; row = rows[i]; break; }
+    }
+    if (rowNum < 0) return res.status(404).json({ error:'Lead not found' });
+
+    // Pad row to 25 columns
+    while (row.length < 25) row.push('');
+
+    // Merge client fields: incoming non-empty values win; empty incoming keeps existing
+    const c = client || {};
+    const colMap = { address:13, city:14, state:15, zip:16, bizAddress:17, bizCity:18,
+                     bizState:19, bizZip:20, bizPhone:21, dlNumber:22, dlState:23 };
+    for (const [field, col] of Object.entries(colMap)) {
+      if (c[field] && String(c[field]).trim()) row[col] = String(c[field]).trim();
+    }
+    // Also fill phone/email/company on the lead if currently empty
+    if (c.phone   && !(row[4]||'').trim()) row[4] = String(c.phone).trim();
+    if (c.email   && !(row[5]||'').trim()) row[5] = String(c.email).trim();
+    if (c.company && !(row[3]||'').trim()) row[3] = String(c.company).trim();
+
+    // Append deal record to deals JSON (col 24 / Y)
+    if (deal && typeof deal === 'object') {
+      let deals = [];
+      try { deals = row[24] ? JSON.parse(row[24]) : []; } catch(e) { deals = []; }
+      deals.unshift(deal);            // newest first
+      if (deals.length > 25) deals = deals.slice(0, 25);
+      row[24] = JSON.stringify(deals);
+    }
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${rowNum}:Y${rowNum}`, valueInputOption:'RAW',
+      requestBody:{ values:[row.slice(0,25)] }
+    });
+    res.json({ success:true });
+  } catch(e) { console.error('enrich error', e); res.status(500).json({ error:'Failed to enrich lead' }); }
 });
 
 // ── INVENTORY ──────────────────────────────────────────────────────────────────
@@ -324,6 +398,7 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
 app.post('/testdrive/save', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient(); const d = req.body; const TD_SHEET = 'TestDrives';
+    await ensureSheetTab(sheets, 'TestDrives');
     let hasHeader = false;
     try { const c = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1` }); hasHeader = !!(c.data.values?.length); } catch(e){}
     if (!hasHeader) {
@@ -543,6 +618,7 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const BOS_SHEET='BillsOfSale';
+    await ensureSheetTab(sheets, 'BillsOfSale');
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
@@ -803,6 +879,7 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
 app.post('/closing/save', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const SHEET='ClosingPackages';
+    await ensureSheetTab(sheets, 'ClosingPackages');
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
