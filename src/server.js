@@ -418,7 +418,7 @@ app.get('/testdrive/history', requireAuth, async (req, res) => {
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:'TestDrives' });
     const rows = response.data.values || [];
     if (rows.length <= 1) return res.json([]);
-    const records = rows.slice(1).map(r => ({
+    const records = rows.slice(1).filter(r=>r && r.length>1 && ((r[1]||'').trim())).map(r => ({
       date:r[0]||'', customerName:r[1]||'', phone:r[2]||'', address:r[3]||'',
       city:r[4]||'', state:r[5]||'', zip:r[6]||'', dlNumber:r[7]||'', dlState:r[8]||'',
       unit:r[9]||'', make:r[10]||'', model:r[11]||'', vin:r[12]||'',
@@ -619,6 +619,10 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const BOS_SHEET='BillsOfSale';
+    if (!d || (!d.personalName && !d.businessName && !d.total)) {
+      console.error('BOS save: empty payload received. Keys:', Object.keys(req.body||{}).join(','));
+      return res.status(400).json({ error:'Empty bill of sale data received — frontend/server version mismatch?' });
+    }
     await ensureSheetTab(sheets, 'BillsOfSale');
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
@@ -655,7 +659,7 @@ app.get('/billsofsale', requireAuth, async (req, res) => {
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'BillsOfSale'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);
-    const records=rows.slice(1).map(r=>({
+    const records=rows.slice(1).filter(r=>r && r.length>2 && ((r[2]||'').trim()||(r[3]||'').trim()||(r[37]||'').toString().trim())).map(r=>({
       id:r[0]||'',date:r[1]||'',personalName:r[2]||'',businessName:r[3]||'',
       address:r[4]||'',city:r[5]||'',state:r[6]||'',zip:r[7]||'',
       bizAddress:r[8]||'',bizCity:r[9]||'',bizState:r[10]||'',bizZip:r[11]||'',
@@ -910,7 +914,7 @@ app.get('/closing', requireAuth, async (req, res) => {
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'ClosingPackages'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);
-    const records=rows.slice(1).map(r=>({
+    const records=rows.slice(1).filter(r=>r && r.length>2 && ((r[2]||'').trim()||(r[3]||'').trim())).map(r=>({
       id:r[0]||'',date:r[1]||'',personalName:r[2]||'',businessName:r[3]||'',
       address:r[4]||'',city:r[5]||'',state:r[6]||'',zip:r[7]||'',phone:r[8]||'',
       unit:r[9]||'',year:r[10]||'',make:r[11]||'',model:r[12]||'',vin:r[13]||'',
@@ -921,6 +925,24 @@ app.get('/closing', requireAuth, async (req, res) => {
     })).reverse();
     res.json(records);
   }catch(e){ console.error('CP list', e.message); res.json([]); }
+});
+
+
+// ── DIAGNOSTIC: inspect raw sheet rows (admin only) ───────────────────────────
+app.get('/debug/sheet/:tab', requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:req.params.tab });
+    const rows = response.data.values || [];
+    res.json({
+      tab: req.params.tab, totalRows: rows.length,
+      headerLength: rows[0] ? rows[0].length : 0,
+      header: rows[0] || [],
+      firstDataRows: rows.slice(1, 4).map(r => ({ length:r.length, first8: r.slice(0,8) })),
+      lastDataRow: rows.length > 1 ? { length: rows[rows.length-1].length, first8: rows[rows.length-1].slice(0,8) } : null,
+    });
+  } catch(e) { res.json({ error: e.message }); }
 });
 
 // ── START ──────────────────────────────────────────────────────────────────────
