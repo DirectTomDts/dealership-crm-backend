@@ -414,6 +414,7 @@ app.post('/testdrive/save', requireAuth, async (req, res) => {
 app.get('/testdrive/history', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
+    await ensureSheetTab(sheets, 'TestDrives');
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:'TestDrives' });
     const rows = response.data.values || [];
     if (rows.length <= 1) return res.json([]);
@@ -424,7 +425,7 @@ app.get('/testdrive/history', requireAuth, async (req, res) => {
       plate:r[13]||'', returnTime:r[14]||'', salesperson:r[15]||'', leadId:r[16]||''
     })).reverse();
     res.json(records);
-  } catch(e) { res.status(500).json({ error:'Failed to load history' }); }
+  } catch(e) { console.error('TD list', e.message); res.json([]); }
 });
 
 // ── BILL OF SALE — GENERATE PDF ────────────────────────────────────────────────
@@ -650,6 +651,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
 app.get('/billsofsale', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient();
+    await ensureSheetTab(sheets, 'BillsOfSale');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'BillsOfSale'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);
@@ -668,7 +670,7 @@ app.get('/billsofsale', requireAuth, async (req, res) => {
       units:r[44]?(()=>{try{return JSON.parse(r[44]);}catch(e){return null;}})():null
     })).reverse();
     res.json(records);
-  } catch(e){res.status(500).json({error:'Failed to load bills of sale'});}
+  } catch(e){ console.error('BOS list', e.message); res.json([]); }
 });
 
 // ── CLOSING PACKAGE ────────────────────────────────────────────────────────────
@@ -904,6 +906,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
 app.get('/closing', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient();
+    await ensureSheetTab(sheets, 'ClosingPackages');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'ClosingPackages'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);
@@ -917,7 +920,7 @@ app.get('/closing', requireAuth, async (req, res) => {
       role:r[24]||'agent',bosId:r[25]||'',notes:r[26]||''
     })).reverse();
     res.json(records);
-  }catch(e){res.status(500).json({error:'Failed to load closing packages'});}
+  }catch(e){ console.error('CP list', e.message); res.json([]); }
 });
 
 // ── START ──────────────────────────────────────────────────────────────────────
