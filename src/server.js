@@ -255,6 +255,19 @@ async function ensureSheetTab(sheets, tabName) {
   } catch(e) { console.warn('ensureSheetTab', tabName, e.message); }
 }
 
+
+// ── SAFE ROW APPEND: writes at explicit A-column position, immune to
+//    Google Sheets append() table-detection quirks that shift columns ─────────
+async function appendRowSafe(sheets, tab, rowValues) {
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: tab })
+    .catch(() => ({ data: {} }));
+  const nextRow = ((resp.data && resp.data.values) || []).length + 1;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID, range: `${tab}!A${nextRow}`, valueInputOption: 'RAW',
+    requestBody: { values: [rowValues] }
+  });
+}
+
 // ── LEAD ENRICHMENT: store client + deal info on the lead ─────────────────────
 app.post('/leads/enrich', requireAuth, async (req, res) => {
   try {
@@ -405,8 +418,7 @@ app.post('/testdrive/save', requireAuth, async (req, res) => {
       await sheets.spreadsheets.values.update({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1`, valueInputOption:'RAW',
         requestBody:{ values:[['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] } });
     }
-    await sheets.spreadsheets.values.append({ spreadsheetId:SHEET_ID, range:TD_SHEET, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
-      requestBody:{ values:[[d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']] } });
+    await appendRowSafe(sheets, TD_SHEET, [d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save record' }); }
 });
@@ -635,8 +647,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
           'Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID','Units JSON']]}});
     }
     const id=d.id||'BOS'+Date.now();
-    await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID,range:BOS_SHEET,valueInputOption:'RAW',insertDataOption:'INSERT_ROWS',
-      requestBody:{values:[[id,d.date||new Date().toISOString().split('T')[0],
+    await appendRowSafe(sheets, BOS_SHEET, [id,d.date||new Date().toISOString().split('T')[0],
         d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',
         d.bizAddress||'',d.bizCity||'',d.bizState||'',d.bizZip||'',
         d.phone||'',d.bizPhone||'',d.email||'',d.dlNumber||'',d.dlState||'',
@@ -647,7 +658,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
         d.salesTax||'',d.titleFee||'',d.docFee||350,
         d.depositAmount||'',d.depositType||'',d.total||'',d.salesperson||'',
         d.item1||'',d.item2||'',d.item3||'',d.item4||'',d.leadId||'',
-        d.units?JSON.stringify(d.units):'']]}});
+        d.units?JSON.stringify(d.units):'']);
     res.json({success:true,id});
   } catch(e){console.error(e);res.status(500).json({error:'Failed to save bill of sale'});}
 });
@@ -896,13 +907,12 @@ app.post('/closing/save', requireAuth, async (req, res) => {
           'Role','Role','BOS ID','Notes']]}});
     }
     const id='CP'+Date.now();
-    await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID,range:SHEET,valueInputOption:'RAW',insertDataOption:'INSERT_ROWS',
-      requestBody:{values:[[id,d.date||new Date().toISOString().split('T')[0],
+    await appendRowSafe(sheets, SHEET, [id,d.date||new Date().toISOString().split('T')[0],
         d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',d.phone||'',
         d.unit||'',d.year||'',d.make||'',d.model||'',d.vin||'',d.salesperson||'',
         d.usdot||'',d.mcNumber||'',d.isLeased?'Yes':'No',
         d.carrierName||'',d.carrierAddress||'',d.carrierCity||'',d.carrierState||'',d.carrierZip||'',d.carrierPhone||'',
-        d.role||'agent',d.bosId||'',d.notes||'']]}});
+        d.role||'agent',d.bosId||'',d.notes||'']);
     res.json({success:true,id});
   }catch(e){console.error(e);res.status(500).json({error:'Failed to save closing package'});}
 });
