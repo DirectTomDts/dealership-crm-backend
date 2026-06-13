@@ -5,6 +5,7 @@ const path       = require('path');
 const fs         = require('fs');
 const { google } = require('googleapis');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+const DBW = require('./dbwrite'); // Phase 3 dual-write (safe: never breaks requests)
 
 const app = express();
 // CORS: if ALLOWED_ORIGINS env var is set, restrict to those domains only.
@@ -217,6 +218,7 @@ app.post('/leads', requireAuth, async (req, res) => {
         l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
         l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
     });
+    await DBW.mirrorLeadInsert(id, l, req.user && req.user.username);
     res.json({ success:true, id });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save lead' }); }
 });
@@ -234,6 +236,7 @@ app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
         l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
         l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
     });
+    await DBW.mirrorLeadUpdate(l, req.user && req.user.username);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to update lead' }); }
 });
@@ -311,6 +314,7 @@ app.post('/leads/enrich', requireAuth, async (req, res) => {
       spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${rowNum}:Y${rowNum}`, valueInputOption:'RAW',
       requestBody:{ values:[row.slice(0,25)] }
     });
+    await DBW.mirrorLeadEnrich(leadId, client);
     res.json({ success:true });
   } catch(e) { console.error('enrich error', e); res.status(500).json({ error:'Failed to enrich lead' }); }
 });
@@ -328,6 +332,7 @@ app.get('/inventory', requireAuth, async (req, res) => {
       ratio:r[8]||'', hp:r[9]||'', listPrice:r[10]||'', salePrice:r[11]||'',
       status:r[12]||'', vin:r[13]||'',
     }));
+    DBW.mirrorInventory(inventory); // fire-and-forget sync; does not block response
     res.json(inventory);
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load inventory' }); }
 });
@@ -419,6 +424,7 @@ app.post('/testdrive/save', requireAuth, async (req, res) => {
         requestBody:{ values:[['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] } });
     }
     await appendRowSafe(sheets, TD_SHEET, [d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']);
+    await DBW.mirrorTestDrive(d, req.user && req.user.username);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save record' }); }
 });
@@ -709,6 +715,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
         d.depositAmount||'',d.depositType||'',d.total||'',d.salesperson||'',
         d.item1||'',d.item2||'',d.item3||'',d.item4||'',d.leadId||'',
         d.units?JSON.stringify(d.units):'']);
+    await DBW.mirrorBillOfSale(id, d, req.user && req.user.username);
     res.json({success:true,id});
   } catch(e){console.error(e);res.status(500).json({error:'Failed to save bill of sale'});}
 });
@@ -963,6 +970,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
         d.usdot||'',d.mcNumber||'',d.isLeased?'Yes':'No',
         d.carrierName||'',d.carrierAddress||'',d.carrierCity||'',d.carrierState||'',d.carrierZip||'',d.carrierPhone||'',
         d.role||'agent',d.bosId||'',d.notes||'']);
+    await DBW.mirrorClosing(id, d, req.user && req.user.username);
     res.json({success:true,id});
   }catch(e){console.error(e);res.status(500).json({error:'Failed to save closing package'});}
 });
