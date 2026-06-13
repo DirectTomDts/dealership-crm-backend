@@ -6,6 +6,12 @@ const fs         = require('fs');
 const { google } = require('googleapis');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const DBW = require('./dbwrite'); // Phase 3 dual-write (safe: never breaks requests)
+const DBR = require('./dbread');   // Phase 4 read layer
+const { isAvailable: pgAvailable } = require('./db');
+// READ_FROM controls where GET routes read. 'postgres' = read from DB, anything
+// else (or unset) = read from Google Sheets. Flip in Railway vars; no code change.
+const READ_FROM = (process.env.READ_FROM || 'sheets').toLowerCase();
+async function usePg() { return READ_FROM === 'postgres' && await pgAvailable(); }
 
 const app = express();
 // CORS: if ALLOWED_ORIGINS env var is set, restrict to those domains only.
@@ -188,6 +194,7 @@ app.get('/dowc-levels', requireAuth, (req, res) => res.json(DOWC_LEVELS));
 // ── LEADS ──────────────────────────────────────────────────────────────────────
 app.get('/leads', requireAuth, async (req, res) => {
   try {
+    if (await usePg()) { return res.json(await DBR.readLeads()); }
     const sheets = getSheetsClient();
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:SHEET_NAME });
     const rows = response.data.values || [];
@@ -227,14 +234,26 @@ app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
     const l = sanitizeObj(req.body);
-    const sheetRow = parseInt(req.params.rowIndex)+1;
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
-    await sheets.spreadsheets.values.update({
-      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:Y${sheetRow}`, valueInputOption:'RAW',
-      requestBody:{ values:[[l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
+    const rowValues = [l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
         l.address||'',l.city||'',l.state||'',l.zip||'',
         l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
-        l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
+        l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):''];
+
+    // Resolve the sheet row by lead id (positional rowIndex is unreliable once
+    // reads come from Postgres). Fall back to the param if id lookup misses.
+    let sheetRow = parseInt(req.params.rowIndex)+1;
+    if (l.id) {
+      try {
+        const resp = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A:A` });
+        const ids = (resp.data.values||[]).map(r => r[0]);
+        const idx = ids.findIndex(x => x === l.id);
+        if (idx >= 0) sheetRow = idx + 1;
+      } catch(e) { /* keep param fallback */ }
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:Y${sheetRow}`, valueInputOption:'RAW',
+      requestBody:{ values:[rowValues] }
     });
     await DBW.mirrorLeadUpdate(l, req.user && req.user.username);
     res.json({ success:true });
@@ -322,6 +341,7 @@ app.post('/leads/enrich', requireAuth, async (req, res) => {
 // ── INVENTORY ──────────────────────────────────────────────────────────────────
 app.get('/inventory', requireAuth, async (req, res) => {
   try {
+    if (await usePg()) { return res.json(await DBR.readInventory()); }
     const sheets = getSheetsClient();
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:'Sheet1' });
     const rows = response.data.values || [];
@@ -431,6 +451,7 @@ app.post('/testdrive/save', requireAuth, async (req, res) => {
 
 app.get('/testdrive/history', requireAuth, async (req, res) => {
   try {
+    if (await usePg()) { return res.json(await DBR.readTestDrives()); }
     const sheets = getSheetsClient();
     await ensureSheetTab(sheets, 'TestDrives');
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:'TestDrives' });
@@ -722,6 +743,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
 
 app.get('/billsofsale', requireAuth, async (req, res) => {
   try {
+    if (await usePg()) { return res.json(await DBR.readBillsOfSale()); }
     const sheets=getSheetsClient();
     await ensureSheetTab(sheets, 'BillsOfSale');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'BillsOfSale'});
@@ -977,6 +999,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
 
 app.get('/closing', requireAuth, async (req, res) => {
   try {
+    if (await usePg()) { return res.json(await DBR.readClosing()); }
     const sheets=getSheetsClient();
     await ensureSheetTab(sheets, 'ClosingPackages');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'ClosingPackages'});
