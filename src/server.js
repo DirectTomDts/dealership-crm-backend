@@ -568,22 +568,72 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     dt(p1,'Direct Truck Sales:',M,y-7,{bold:true,size:9});dt(p1,'_________________________________',M+120,y-7,{size:9});
     dt(p1,'Date:',M+372,y-7,{bold:true,size:9});dt(p1,'__________',M+398,y-7,{size:9});
 
-    const p2=pdfDoc.addPage([W,H]);let y2=await addHeader(p2,'TERMS & CONDITIONS');
-    box(p2,M,y2-32,W-M*2,44);
+    // ── TERMS & CONDITIONS (robust) ───────────────────────────────────────────
+    const TERMS = [
+      ['1. AS-IS SALE; DISCLAIMER OF ALL WARRANTIES',
+       'THE VEHICLE(S) DESCRIBED ABOVE ARE SOLD "AS IS", "WHERE IS", AND "WITH ALL FAULTS". DEALER EXPRESSLY DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED WARRANTY OF MERCHANTABILITY AND ANY IMPLIED WARRANTY OF FITNESS FOR A PARTICULAR PURPOSE, AND ANY WARRANTY OF QUALITY, WORKMANSHIP, DESIGN, CONDITION, OR PERFORMANCE. NO WARRANTY EXTENDS BEYOND THE DESCRIPTION OF THE VEHICLE(S) ON THE FACE OF THIS AGREEMENT. PURCHASER WILL BEAR THE ENTIRE EXPENSE OF REPAIRING OR CORRECTING ANY DEFECT THAT NOW EXISTS OR THAT MAY HEREAFTER ARISE.', true],
+      ['2. PURCHASER INSPECTION; NO RELIANCE',
+       'Purchaser acknowledges having had a full opportunity to inspect, and/or to have an independent mechanic of Purchaser\'s choosing inspect, and/or to test-drive the vehicle(s) prior to purchase, and that the decision to purchase is based solely on that inspection and Purchaser\'s own judgment. Purchaser has not relied on any oral statement, description, advertisement, or representation of Dealer or any salesperson concerning the condition, performance, prior use, service history, hours, or mileage of the vehicle(s) that is not expressly written in this Agreement.'],
+      ['3. MANUFACTURER WARRANTIES ONLY',
+       'Unless Dealer furnishes Purchaser with a separate written warranty or service contract issued by Dealer on its own behalf, any warranty that may still apply to the vehicle(s) is solely that of the manufacturer or other third-party supplier. All such warranties, if any, are those of the manufacturer or supplier alone, not Dealer, and only the manufacturer or supplier shall be liable for performance under them. Any service contract sold with this purchase is administered by the issuing provider identified in the service contract, not Dealer.'],
+      ['4. LIMITATION OF LIABILITY',
+       'TO THE FULLEST EXTENT PERMITTED BY LAW, DEALER SHALL NOT BE LIABLE FOR ANY CONSEQUENTIAL, INCIDENTAL, SPECIAL, EXEMPLARY, OR PUNITIVE DAMAGES OF ANY KIND, including without limitation damage to property, loss of use, loss of time, towing or storage charges, lost profits, lost income, lost loads or contracts, downtime, or substitute equipment costs, arising from or relating to any defect, unfitness, failure, or deficiency of the vehicle(s). In no event shall Dealer\'s total aggregate liability arising out of or related to this Agreement exceed the purchase price actually paid by Purchaser for the vehicle giving rise to the claim.'],
+      ['5. COMMERCIAL TRANSACTION',
+       'Purchaser represents that the vehicle(s) are purchased for commercial, business, or resale purposes and not primarily for personal, family, or household use, and that Purchaser is experienced in the purchase and operation of commercial motor vehicles. To the extent permitted by law, consumer-protection statutes applicable to household goods do not apply to this transaction.'],
+      ['6. TAXES, FEES & REGISTRATION',
+       'Purchaser is solely responsible for all applicable local, state, and federal taxes, title fees, registration fees, permit fees, and any other governmental charges arising from this purchase, whether or not collected by Dealer at closing. Any tax, fee, or charge later assessed with respect to this sale shall be paid by Purchaser, and Purchaser shall reimburse Dealer on demand for any such amount Dealer is required to pay.'],
+      ['7. TITLE, RISK OF LOSS & STORAGE',
+       'Title to the vehicle(s) shall not pass to Purchaser until the full purchase price has been received by Dealer in cleared funds. Risk of loss or damage passes to Purchaser upon delivery or upon Purchaser taking possession, whichever occurs first. Vehicles not picked up within fourteen (14) days after notice of availability may be subject to reasonable storage charges. Until full payment, Dealer retains, and Purchaser grants Dealer, a security interest in the vehicle(s) and all proceeds thereof.'],
+      ['8. DEPOSITS & PAYMENT',
+       'All deposits are non-refundable once Dealer has removed the vehicle from sale, commenced any requested work, or incurred costs in reliance on this Agreement, except as otherwise required by law. Payment by check or electronic transfer is not complete until finally settled in Dealer\'s account. Any payment dishonored for any reason shall entitle Dealer to cancel this Agreement, retake possession where permitted by law, and recover all resulting costs.'],
+      ['9. POST-SALE COMPLIANCE & OPERATION',
+       'Upon delivery, Purchaser is solely responsible for the vehicle(s), including registration, insurance, inspection, maintenance, mechanical operation, load securement, and safety, and for compliance with all applicable laws and regulations, including U.S. DOT and FMCSA requirements. Any annual inspection report furnished at sale reflects condition only as of its date and is not a warranty of future condition or compliance.'],
+      ['10. RELEASE & INDEMNIFICATION',
+       'Purchaser, for itself and its owners, officers, employees, agents, family members, dependents, guests, and any affiliated or interested parties, fully and forever releases and discharges Dealer and its owners, officers, employees, and agents (the "Released Parties") from any and all injuries (including death), losses, damages, claims (including ordinary negligence claims), demands, lawsuits, expenses, and liabilities of any kind, directly or indirectly arising out of, concerning, or relating to the purchase, ownership, possession, operation, or use of the vehicle(s), even if caused by the negligence, omission, or other fault of the Released Parties, to the fullest extent permitted by law. Purchaser shall defend, indemnify, and hold the Released Parties harmless from any third-party claim arising out of the ownership, operation, or use of the vehicle(s) after delivery.'],
+      ['11. ENTIRE AGREEMENT; FTC BUYERS GUIDE',
+       'This Agreement, together with any written warranty or service contract expressly issued with it, constitutes the entire agreement between the parties and supersedes all prior or contemporaneous oral or written communications. No salesperson or representative has authority to modify these terms except in a writing signed by an authorized officer of Dealer. For any used vehicle, the information on the window-form FTC Buyers Guide provided with the vehicle is incorporated into this Agreement and, in the event of any conflict, the Buyers Guide controls.'],
+      ['12. ODOMETER & HOUR METER; CERTIFICATION; FEDERAL EXEMPTION',
+       'Dealer certifies that, while the vehicle(s) were in Dealer\'s possession, Dealer has not altered, disconnected, reset, or tampered with any odometer or hour meter. The odometer and hour-meter readings stated, if any, are accurate to the best of Dealer\'s knowledge; however, Dealer did not operate the vehicle(s) during their prior service life, has no personal knowledge of their prior use, and cannot and does not verify any reading accrued before Dealer\'s possession. Service and accident history, if any, is provided only as received from prior owners or third-party sources and is not verified or guaranteed by Dealer. PURCHASER ACKNOWLEDGES THAT EACH VEHICLE HAS A GROSS VEHICLE WEIGHT RATING IN EXCESS OF 16,000 POUNDS AND IS THEREFORE EXEMPT FROM FEDERAL ODOMETER MILEAGE DISCLOSURE REQUIREMENTS UNDER 49 C.F.R. \u00a7 580.17; ANY MILEAGE OR HOURS STATED ARE PROVIDED FOR REFERENCE ONLY, DO NOT CONSTITUTE AN ODOMETER DISCLOSURE, AND ARE NOT A REPRESENTATION OR WARRANTY OF ACTUAL MILEAGE, HOURS, OR USE. The purchase price was not determined in reliance on any particular mileage or hours. To the fullest extent permitted by law, Purchaser releases and waives any claim arising from any inaccuracy or discrepancy in odometer or hour-meter readings or vehicle history, except to the extent such claim arises from Dealer\'s own intentional alteration of a reading or knowing misrepresentation while the vehicle(s) were in Dealer\'s possession.', true],
+      ['13. GOVERNING LAW; VENUE; ATTORNEY FEES',
+       'This Agreement is governed by the laws of the State of Illinois, without regard to conflict-of-law rules. Exclusive venue for any dispute arising out of or relating to this Agreement shall lie in the state courts located in DuPage County, Illinois, and the parties consent to personal jurisdiction there. The prevailing party in any action to enforce this Agreement shall be entitled to recover its reasonable attorney fees and costs.'],
+      ['14. SEVERABILITY; WAIVER',
+       'If any provision of this Agreement is held invalid or unenforceable, the remaining provisions shall continue in full force and effect, and the invalid provision shall be enforced to the maximum extent permitted. No waiver of any provision shall be effective unless in writing, and no waiver shall constitute a continuing waiver.'],
+    ];
+
+    let p2 = pdfDoc.addPage([W,H]);
+    let y2 = await addHeader(p2,'TERMS & CONDITIONS OF SALE');
+    // vehicle reference box
+    const vboxH = 16 + units.length*14;
+    box(p2,M,y2-vboxH+8,W-M*2,vboxH);
     units.forEach((u,i)=>{
       dt(p2,`${u.year||''} ${u.make||''} ${u.model||''}`,M+8,y2-10-(i*14),{bold:true,size:9,maxWidth:200});
       dt(p2,'VIN: '+(u.vin||''),M+216,y2-10-(i*14),{size:8.5,maxWidth:165});
       dt(p2,'Unit: '+(u.unit||''),M+400,y2-10-(i*14),{size:8.5});
     });
-    y2-=46;
-    dt(p2,"Terms — Used Vehicle Dealer's Warranty Disclaimer",M,y2,{bold:true,size:9.5});y2-=16;
-    p2.drawText("The above-described motor vehicle(s) are sold \"as is\" with all faults. No warranty of merchantability or fitness is made. Buyer bears all repair costs. Direct Truck Sales Inc shall not be liable for consequential or incidental damages. Buyer is responsible for all registration and title fees, confirms inspection and purchase decision based thereon. All manufacturer warranties are the manufacturer's alone. Buyer releases Direct Truck Sales Inc from any current or future liabilities. Upon completion buyer is solely responsible for the vehicle.",
-      {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
-    y2-=100;
-    dt(p2,'Release from Liability',M,y2,{bold:true,size:9});y2-=14;
-    p2.drawText('I fully and forever release and discharge Direct Truck Sales Inc from all injuries, losses, damages, claims and liabilities arising from my use of the motor vehicle(s), even if due to their negligence, to the fullest extent permitted by law.',
-      {x:M,y:y2,size:7.8,font,color:rgb(0.1,0.1,0.1),maxWidth:W-M*2,lineHeight:12});
-    y2-=50;ln(p2,y2+8);
+    y2 -= vboxH + 10;
+
+    const termWidth = W - M*2;
+    for (const [heading, body, isCaps] of TERMS) {
+      const charsPerLine = isCaps ? 104 : 138;
+      const estLines = Math.ceil(body.length / charsPerLine);
+      const blockH = 11 + estLines*9.5 + 7;
+      if (y2 - blockH < 130) { p2 = pdfDoc.addPage([W,H]); y2 = await addHeader(p2,'TERMS & CONDITIONS (cont.)'); }
+      dt(p2, heading, M, y2, {bold:true, size:7.8});
+      y2 -= 10;
+      p2.drawText(body, {x:M, y:y2, size:7, font, color:rgb(0.08,0.08,0.08), maxWidth:termWidth, lineHeight:9.5});
+      y2 -= estLines*9.5 + 8;
+    }
+
+    // acknowledgment + signatures (new page if tight)
+    if (y2 < 130) { p2 = pdfDoc.addPage([W,H]); y2 = await addHeader(p2,'TERMS & CONDITIONS (cont.)'); }
+    y2 -= 4;
+    dt(p2,'PURCHASER ACKNOWLEDGES HAVING READ, UNDERSTOOD, AND AGREED TO ALL TERMS ABOVE, INCLUDING THE AS-IS',M,y2,{bold:true,size:7.5});
+    y2 -= 10;
+    dt(p2,'WARRANTY DISCLAIMER (SEC. 1), LIMITATION OF LIABILITY (SEC. 4), RELEASE (SEC. 10), AND ODOMETER /',M,y2,{bold:true,size:7.5});
+    y2 -= 10;
+    dt(p2,'HOUR-METER CERTIFICATION AND EXEMPTION (SEC. 12).',M,y2,{bold:true,size:7.5});
+    dt(p2,'Purchaser initials: ___________',W-M-130,y2,{size:8});
+    y2 -= 22; ln(p2,y2+8);
     dt(p2,'Purchaser Signature:',M,y2-7,{bold:true,size:9});dt(p2,'_________________________________',M+120,y2-7,{size:9});
     dt(p2,'Date:',M+372,y2-7,{bold:true,size:9});dt(p2,'__________',M+398,y2-7,{size:9});
     y2-=20;
