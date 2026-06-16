@@ -8,10 +8,15 @@ const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 const DBW = require('./dbwrite'); // Phase 3 dual-write (safe: never breaks requests)
 const DBR = require('./dbread');   // Phase 4 read layer
 const { isAvailable: pgAvailable } = require('./db');
+const { query: pgQuery } = require('./db');
+const bcrypt = require('bcryptjs'); // Phase 5: hashed passwords
 // READ_FROM controls where GET routes read. 'postgres' = read from DB, anything
 // else (or unset) = read from Google Sheets. Flip in Railway vars; no code change.
 const READ_FROM = (process.env.READ_FROM || 'sheets').toLowerCase();
 async function usePg() { return READ_FROM === 'postgres' && await pgAvailable(); }
+// Phase 5: per-save Sheets writes are off by default (nightly backup handles Sheets).
+// Set WRITE_TO_SHEETS=true to re-enable live dual-write to Sheets.
+const WRITE_TO_SHEETS = (process.env.WRITE_TO_SHEETS || 'false').toLowerCase() === 'true';
 
 const app = express();
 // CORS: if ALLOWED_ORIGINS env var is set, restrict to those domains only.
@@ -175,17 +180,39 @@ function sanitizeObj(obj) {
 app.get('/', (req, res) => res.json({ status:'Dealer CRM API running' }));
 
 // ── AUTH ───────────────────────────────────────────────────────────────────────
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   if (checkRateLimit(ip)) {
     return res.status(429).json({ error: 'Too many login attempts. Try again in 15 minutes.' });
   }
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-  const user = USERS.find(u => u.username === (username||'').toLowerCase() && u.password === password);
-  if (!user) return res.status(401).json({ error:'Invalid username or password' });
-  const token = jwt.sign({ username:user.username, name:user.name, role:user.role }, JWT_SECRET, { expiresIn:'12h' });
-  res.json({ token, name:user.name, role:user.role });
+  const uname = (username||'').toLowerCase();
+
+  // Try the database first (bcrypt-hashed users)
+  let authed = null;
+  try {
+    if (await pgAvailable()) {
+      const { rows } = await pgQuery('SELECT username, password_hash, name, role, active FROM users WHERE username=$1', [uname]);
+      if (rows.length) {
+        const u = rows[0];
+        if (u.active === false) return res.status(403).json({ error:'Account disabled' });
+        const ok = await bcrypt.compare(password, u.password_hash);
+        if (ok) authed = { username:u.username, name:u.name, role:u.role };
+        else return res.status(401).json({ error:'Invalid username or password' });
+      }
+    }
+  } catch(e) { console.warn('DB auth failed, falling back to env users:', e.message); }
+
+  // Fall back to env-var users only if the DB had no such user (transition safety)
+  if (!authed) {
+    const u = USERS.find(x => x.username === uname && x.password === password);
+    if (!u) return res.status(401).json({ error:'Invalid username or password' });
+    authed = { username:u.username, name:u.name, role:u.role };
+  }
+
+  const token = jwt.sign(authed, JWT_SECRET, { expiresIn:'12h' });
+  res.json({ token, name:authed.name, role:authed.role });
 });
 
 // ── DOWC ───────────────────────────────────────────────────────────────────────
@@ -218,7 +245,7 @@ app.post('/leads', requireAuth, async (req, res) => {
     const l = sanitizeObj(req.body);
     const id = 'L'+Date.now();
     const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
-    await sheets.spreadsheets.values.append({
+    if (WRITE_TO_SHEETS) await sheets.spreadsheets.values.append({
       spreadsheetId:SHEET_ID, range:SHEET_NAME, valueInputOption:'RAW', insertDataOption:'INSERT_ROWS',
       requestBody:{ values:[[id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
         l.address||'',l.city||'',l.state||'',l.zip||'',
@@ -338,6 +365,95 @@ app.post('/leads/enrich', requireAuth, async (req, res) => {
   } catch(e) { console.error('enrich error', e); res.status(500).json({ error:'Failed to enrich lead' }); }
 });
 
+
+// ── USER MANAGEMENT (admin only) ──────────────────────────────────────────────
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error:'Admin access required' });
+  next();
+}
+
+app.get('/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pgQuery('SELECT id, username, name, role, active, created_at FROM users ORDER BY username');
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load users' }); }
+});
+
+app.post('/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { username, password, name, role } = sanitizeObj(req.body);
+    if (!username || !password || !name) return res.status(400).json({ error:'Username, password, and name required' });
+    if (String(password).length < 6) return res.status(400).json({ error:'Password must be at least 6 characters' });
+    const uname = String(username).toLowerCase().trim();
+    const hash = await bcrypt.hash(password, 10);
+    await pgQuery(`INSERT INTO users (username, password_hash, name, role, active)
+                  VALUES ($1,$2,$3,$4,TRUE)
+                  ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash, name=EXCLUDED.name, role=EXCLUDED.role`,
+      [uname, hash, name, role==='admin'?'admin':'sales']);
+    await audit2(req.user.username, 'create', 'user', uname, { name, role });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save user' }); }
+});
+
+app.put('/users/:username', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const target = (req.params.username||'').toLowerCase();
+    const { password, name, role, active } = sanitizeObj(req.body);
+    // Build dynamic update
+    const sets = [], vals = []; let i = 1;
+    if (name)            { sets.push(`name=$${i++}`); vals.push(name); }
+    if (role)            { sets.push(`role=$${i++}`); vals.push(role==='admin'?'admin':'sales'); }
+    if (active !== undefined) { sets.push(`active=$${i++}`); vals.push(!!active); }
+    if (password)        {
+      if (String(password).length < 6) return res.status(400).json({ error:'Password must be at least 6 characters' });
+      sets.push(`password_hash=$${i++}`); vals.push(await bcrypt.hash(password, 10));
+    }
+    if (!sets.length) return res.status(400).json({ error:'Nothing to update' });
+    vals.push(target);
+    await pgQuery(`UPDATE users SET ${sets.join(', ')} WHERE username=$${i}`, vals);
+    await audit2(req.user.username, 'update', 'user', target, { fields: sets.map(s=>s.split('=')[0]) });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to update user' }); }
+});
+
+app.delete('/users/:username', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const target = (req.params.username||'').toLowerCase();
+    if (target === req.user.username) return res.status(400).json({ error:'You cannot delete your own account' });
+    // Soft-delete: deactivate rather than remove, to preserve audit references
+    await pgQuery('UPDATE users SET active=FALSE WHERE username=$1', [target]);
+    await audit2(req.user.username, 'delete', 'user', target, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to deactivate user' }); }
+});
+
+// ── AUDIT LOG (admin only, with filters) ──────────────────────────────────────
+app.get('/audit', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { user, entity, entity_id, from, to, limit } = req.query;
+    const where = [], vals = []; let i = 1;
+    if (user)      { where.push(`username=$${i++}`);  vals.push(String(user).toLowerCase()); }
+    if (entity)    { where.push(`entity=$${i++}`);    vals.push(entity); }
+    if (entity_id) { where.push(`entity_id=$${i++}`); vals.push(entity_id); }
+    if (from)      { where.push(`at >= $${i++}`);     vals.push(from); }
+    if (to)        { where.push(`at <= $${i++}`);     vals.push(to + ' 23:59:59'); }
+    const lim = Math.min(parseInt(limit) || 200, 1000);
+    const sql = `SELECT id, username, action, entity, entity_id, detail, at FROM audit_log
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY at DESC LIMIT ${lim}`;
+    const { rows } = await pgQuery(sql, vals);
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load audit log' }); }
+});
+
+// Small audit helper that uses the server's own pg connection (separate from dbwrite's)
+async function audit2(username, action, entity, entityId, detail) {
+  try {
+    await pgQuery('INSERT INTO audit_log (username, action, entity, entity_id, detail) VALUES ($1,$2,$3,$4,$5)',
+      [username||'system', action, entity, String(entityId||''), detail?JSON.stringify(detail):null]);
+  } catch(e) { console.warn('audit2 failed:', e.message); }
+}
+
 // ── INVENTORY ──────────────────────────────────────────────────────────────────
 app.get('/inventory', requireAuth, async (req, res) => {
   try {
@@ -436,14 +552,14 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
 app.post('/testdrive/save', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient(); const d = req.body; const TD_SHEET = 'TestDrives';
-    await ensureSheetTab(sheets, 'TestDrives');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'TestDrives');
     let hasHeader = false;
     try { const c = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1` }); hasHeader = !!(c.data.values?.length); } catch(e){}
     if (!hasHeader) {
       await sheets.spreadsheets.values.update({ spreadsheetId:SHEET_ID, range:`${TD_SHEET}!A1`, valueInputOption:'RAW',
         requestBody:{ values:[['Date','Customer Name','Phone','Address','City','State','Zip','DL #','DL State','Unit','Make','Model','VIN','Plate','Return Time','Salesperson','Lead ID']] } });
     }
-    await appendRowSafe(sheets, TD_SHEET, [d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']);
+    if (WRITE_TO_SHEETS) await appendRowSafe(sheets, TD_SHEET, [d.date,d.customerName,d.phone,d.address,d.city,d.state,d.zip,d.dlNumber,d.dlState,d.unit,d.make,d.model,d.vin,d.plate,d.returnTime,d.salesperson,d.leadId||'']);
     await DBW.mirrorTestDrive(d, req.user && req.user.username);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save record' }); }
@@ -453,7 +569,7 @@ app.get('/testdrive/history', requireAuth, async (req, res) => {
   try {
     if (await usePg()) { return res.json(await DBR.readTestDrives()); }
     const sheets = getSheetsClient();
-    await ensureSheetTab(sheets, 'TestDrives');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'TestDrives');
     const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:'TestDrives' });
     const rows = response.data.values || [];
     if (rows.length <= 1) return res.json([]);
@@ -712,7 +828,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
       console.error('BOS save: empty payload received. Keys:', Object.keys(req.body||{}).join(','));
       return res.status(400).json({ error:'Empty bill of sale data received — frontend/server version mismatch?' });
     }
-    await ensureSheetTab(sheets, 'BillsOfSale');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'BillsOfSale');
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${BOS_SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
@@ -724,7 +840,7 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
           'Deposit Amount','Deposit Type','Total','Salesperson','Item1','Item2','Item3','Item4','Lead ID','Units JSON']]}});
     }
     const id=d.id||'BOS'+Date.now();
-    await appendRowSafe(sheets, BOS_SHEET, [id,d.date||new Date().toISOString().split('T')[0],
+    if (WRITE_TO_SHEETS) await appendRowSafe(sheets, BOS_SHEET, [id,d.date||new Date().toISOString().split('T')[0],
         d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',
         d.bizAddress||'',d.bizCity||'',d.bizState||'',d.bizZip||'',
         d.phone||'',d.bizPhone||'',d.email||'',d.dlNumber||'',d.dlState||'',
@@ -745,7 +861,7 @@ app.get('/billsofsale', requireAuth, async (req, res) => {
   try {
     if (await usePg()) { return res.json(await DBR.readBillsOfSale()); }
     const sheets=getSheetsClient();
-    await ensureSheetTab(sheets, 'BillsOfSale');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'BillsOfSale');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'BillsOfSale'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);
@@ -975,7 +1091,7 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
 app.post('/closing/save', requireAuth, async (req, res) => {
   try {
     const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const SHEET='ClosingPackages';
-    await ensureSheetTab(sheets, 'ClosingPackages');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'ClosingPackages');
     let hasHeader=false;
     try{const c=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${SHEET}!A1`});hasHeader=!!(c.data.values?.length);}catch(e){}
     if(!hasHeader){
@@ -986,7 +1102,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
           'Role','Role','BOS ID','Notes']]}});
     }
     const id='CP'+Date.now();
-    await appendRowSafe(sheets, SHEET, [id,d.date||new Date().toISOString().split('T')[0],
+    if (WRITE_TO_SHEETS) await appendRowSafe(sheets, SHEET, [id,d.date||new Date().toISOString().split('T')[0],
         d.personalName||'',d.businessName||'',d.address||'',d.city||'',d.state||'',d.zip||'',d.phone||'',
         d.unit||'',d.year||'',d.make||'',d.model||'',d.vin||'',d.salesperson||'',
         d.usdot||'',d.mcNumber||'',d.isLeased?'Yes':'No',
@@ -1001,7 +1117,7 @@ app.get('/closing', requireAuth, async (req, res) => {
   try {
     if (await usePg()) { return res.json(await DBR.readClosing()); }
     const sheets=getSheetsClient();
-    await ensureSheetTab(sheets, 'ClosingPackages');
+    if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'ClosingPackages');
     const response=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:'ClosingPackages'});
     const rows=response.data.values||[];
     if(rows.length<=1) return res.json([]);

@@ -11,12 +11,20 @@
 const { query, withTransaction, isAvailable, audit } = require('./db');
 
 // Wrap any mirror so it can never break the main request
+// When PRIMARY is true (Sheets writes disabled), a Postgres failure MUST surface
+// so the save isn't silently lost. When false (dual-write era), failures are
+// swallowed because Sheets is still the source of truth.
+const PRIMARY = (process.env.WRITE_TO_SHEETS || 'false').toLowerCase() !== 'true';
 function safe(label, fn) {
   return async (...args) => {
     try {
-      if (!(await isAvailable())) return; // Postgres not configured — silently skip
+      if (!(await isAvailable())) {
+        if (PRIMARY) throw new Error('Database unavailable and Sheets writes are disabled');
+        return; // dual-write era: Postgres optional
+      }
       await fn(...args);
     } catch (e) {
+      if (PRIMARY) { console.error(`[primary-write] ${label} FAILED:`, e.message); throw e; }
       console.warn(`[dual-write] ${label} failed (Sheets unaffected):`, e.message);
     }
   };
