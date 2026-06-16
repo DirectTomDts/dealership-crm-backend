@@ -293,30 +293,34 @@ app.post('/leads', requireAuth, async (req, res) => {
 
 app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
   try {
-    const sheets = getSheetsClient();
     const l = sanitizeObj(req.body);
-    const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
-    const rowValues = [l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
-        l.address||'',l.city||'',l.state||'',l.zip||'',
-        l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
-        l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):''];
 
-    // Resolve the sheet row by lead id (positional rowIndex is unreliable once
-    // reads come from Postgres). Fall back to the param if id lookup misses.
-    let sheetRow = parseInt(req.params.rowIndex)+1;
-    if (l.id) {
-      try {
-        const resp = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A:A` });
-        const ids = (resp.data.values||[]).map(r => r[0]);
-        const idx = ids.findIndex(x => x === l.id);
-        if (idx >= 0) sheetRow = idx + 1;
-      } catch(e) { /* keep param fallback */ }
-    }
-    await sheets.spreadsheets.values.update({
-      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:Y${sheetRow}`, valueInputOption:'RAW',
-      requestBody:{ values:[rowValues] }
-    });
+    // Postgres is the source of truth — write it FIRST so the save can't be
+    // lost by a Sheets hiccup. mirrorLeadUpdate throws if PG fails (primary mode).
     await DBW.mirrorLeadUpdate(l, req.user && req.user.username);
+
+    // Best-effort Sheets mirror (only when enabled). Never blocks the save.
+    if (WRITE_TO_SHEETS) {
+      try {
+        const sheets = getSheetsClient();
+        const archived = ['Sold','Dead'].includes(l.status) ? 'true' : 'false';
+        const rowValues = [l.id,l.first,l.last,l.company,l.phone,l.email,l.unit,l.source,l.status,l.sales,l.followup,l.notes,archived,
+            l.address||'',l.city||'',l.state||'',l.zip||'',
+            l.bizAddress||'',l.bizCity||'',l.bizState||'',l.bizZip||'',l.bizPhone||'',
+            l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):''];
+        let sheetRow = parseInt(req.params.rowIndex)+1;
+        if (l.id) {
+          const resp = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A:A` });
+          const ids = (resp.data.values||[]).map(r => r[0]);
+          const idx = ids.findIndex(x => x === l.id);
+          if (idx >= 0) sheetRow = idx + 1;
+        }
+        await sheets.spreadsheets.values.update({
+          spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${sheetRow}:Y${sheetRow}`, valueInputOption:'RAW',
+          requestBody:{ values:[rowValues] }
+        });
+      } catch(sheetErr) { console.warn('Lead Sheets mirror failed (PG saved):', sheetErr.message); }
+    }
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to update lead' }); }
 });
@@ -354,47 +358,42 @@ async function appendRowSafe(sheets, tab, rowValues) {
 // ── LEAD ENRICHMENT: store client + deal info on the lead ─────────────────────
 app.post('/leads/enrich', requireAuth, async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const { leadId, client, deal } = sanitizeObj(req.body);
+    const { leadId, client } = sanitizeObj(req.body);
     if (!leadId) return res.status(400).json({ error:'leadId required' });
 
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:SHEET_NAME });
-    const rows = response.data.values || [];
-    let rowNum = -1, row = null;
-    for (let i = 1; i < rows.length; i++) {
-      if ((rows[i][0]||'') === leadId) { rowNum = i + 1; row = rows[i]; break; }
+    // Postgres primary: merge the client info onto the lead. The deal itself is
+    // captured relationally when the BOS/closing/test-drive row is saved with
+    // this lead_id, so we no longer stuff a deals JSON blob anywhere.
+    await DBW.mirrorLeadEnrich(leadId, client || {});
+
+    // Best-effort Sheets mirror of the client fields (only when enabled)
+    if (WRITE_TO_SHEETS) {
+      try {
+        const sheets = getSheetsClient();
+        const response = await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:SHEET_NAME });
+        const rows = response.data.values || [];
+        let rowNum = -1, row = null;
+        for (let i = 1; i < rows.length; i++) {
+          if ((rows[i][0]||'') === leadId) { rowNum = i + 1; row = rows[i]; break; }
+        }
+        if (rowNum > 0) {
+          while (row.length < 25) row.push('');
+          const c = client || {};
+          const colMap = { address:13, city:14, state:15, zip:16, bizAddress:17, bizCity:18,
+                           bizState:19, bizZip:20, bizPhone:21, dlNumber:22, dlState:23 };
+          for (const [field, col] of Object.entries(colMap)) {
+            if (c[field] && String(c[field]).trim()) row[col] = String(c[field]).trim();
+          }
+          if (c.phone   && !(row[4]||'').trim()) row[4] = String(c.phone).trim();
+          if (c.email   && !(row[5]||'').trim()) row[5] = String(c.email).trim();
+          if (c.company && !(row[3]||'').trim()) row[3] = String(c.company).trim();
+          await sheets.spreadsheets.values.update({
+            spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${rowNum}:Y${rowNum}`, valueInputOption:'RAW',
+            requestBody:{ values:[row.slice(0,25)] }
+          });
+        }
+      } catch(sheetErr) { console.warn('Enrich Sheets mirror failed (PG saved):', sheetErr.message); }
     }
-    if (rowNum < 0) return res.status(404).json({ error:'Lead not found' });
-
-    // Pad row to 25 columns
-    while (row.length < 25) row.push('');
-
-    // Merge client fields: incoming non-empty values win; empty incoming keeps existing
-    const c = client || {};
-    const colMap = { address:13, city:14, state:15, zip:16, bizAddress:17, bizCity:18,
-                     bizState:19, bizZip:20, bizPhone:21, dlNumber:22, dlState:23 };
-    for (const [field, col] of Object.entries(colMap)) {
-      if (c[field] && String(c[field]).trim()) row[col] = String(c[field]).trim();
-    }
-    // Also fill phone/email/company on the lead if currently empty
-    if (c.phone   && !(row[4]||'').trim()) row[4] = String(c.phone).trim();
-    if (c.email   && !(row[5]||'').trim()) row[5] = String(c.email).trim();
-    if (c.company && !(row[3]||'').trim()) row[3] = String(c.company).trim();
-
-    // Append deal record to deals JSON (col 24 / Y)
-    if (deal && typeof deal === 'object') {
-      let deals = [];
-      try { deals = row[24] ? JSON.parse(row[24]) : []; } catch(e) { deals = []; }
-      deals.unshift(deal);            // newest first
-      if (deals.length > 25) deals = deals.slice(0, 25);
-      row[24] = JSON.stringify(deals);
-    }
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId:SHEET_ID, range:`${SHEET_NAME}!A${rowNum}:Y${rowNum}`, valueInputOption:'RAW',
-      requestBody:{ values:[row.slice(0,25)] }
-    });
-    await DBW.mirrorLeadEnrich(leadId, client);
     res.json({ success:true });
   } catch(e) { console.error('enrich error', e); res.status(500).json({ error:'Failed to enrich lead' }); }
 });
@@ -491,19 +490,30 @@ async function audit2(username, action, entity, entityId, detail) {
 // ── INVENTORY ──────────────────────────────────────────────────────────────────
 app.get('/inventory', requireAuth, async (req, res) => {
   try {
-    if (await usePg()) { return res.json(await DBR.readInventory()); }
-    const sheets = getSheetsClient();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:'Sheet1' });
-    const rows = response.data.values || [];
-    if (rows.length <= 1) return res.json([]);
-    const inventory = rows.slice(1).map(r => ({
-      unit:r[0]||'', year:r[1]||'', make:r[2]||'', model:r[3]||'',
-      hours:r[4]||'', miles:r[5]||'', apu:r[6]||'', color:r[7]||'',
-      ratio:r[8]||'', hp:r[9]||'', listPrice:r[10]||'', salePrice:r[11]||'',
-      status:r[12]||'', vin:r[13]||'',
-    }));
-    DBW.mirrorInventory(inventory); // fire-and-forget sync; does not block response
-    res.json(inventory);
+    // Inventory is maintained by hand in the Google Sheet, so ALWAYS read the
+    // sheet as the source of truth and sync it into Postgres. (Reading only from
+    // Postgres would mean Sheet edits never show up.)
+    let inventory = null;
+    try {
+      const sheets = getSheetsClient();
+      const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:'Sheet1' });
+      const rows = response.data.values || [];
+      inventory = rows.length <= 1 ? [] : rows.slice(1).map(r => ({
+        unit:r[0]||'', year:r[1]||'', make:r[2]||'', model:r[3]||'',
+        hours:r[4]||'', miles:r[5]||'', apu:r[6]||'', color:r[7]||'',
+        ratio:r[8]||'', hp:r[9]||'', listPrice:r[10]||'', salePrice:r[11]||'',
+        status:r[12]||'', vin:r[13]||'',
+      }));
+    } catch(sheetErr) {
+      console.warn('Inventory sheet read failed, falling back to Postgres:', sheetErr.message);
+    }
+    if (inventory) {
+      DBW.mirrorInventory(inventory);   // keep PG copy current
+      return res.json(inventory);
+    }
+    // Sheet unreachable — serve last-known from Postgres
+    if (await usePg()) return res.json(await DBR.readInventory());
+    res.json([]);
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load inventory' }); }
 });
 
