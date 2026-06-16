@@ -110,6 +110,39 @@ function getSheetsClient() {
 }
 
 // ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
+// ── ROLE PERMISSIONS ──────────────────────────────────────────────────────────
+// Add roles or features here. A role listed for a feature is allowed.
+// admin implicitly has every feature.
+const FEATURE_ACCESS = {
+  closing: ['office', 'admin'],   // Sales cannot access closing package
+  users:   ['admin'],
+  audit:   ['admin'],
+  // leads, testdrive, billsofsale, inventory: open to all logged-in roles
+};
+function roleCan(role, feature) {
+  if (role === 'admin') return true;
+  const allowed = FEATURE_ACCESS[feature];
+  if (!allowed) return true;            // unrestricted feature
+  return allowed.includes(role);
+}
+// Build a permission object the frontend can use to show/hide UI.
+function permissionsFor(role) {
+  return {
+    closing: roleCan(role, 'closing'),
+    users:   roleCan(role, 'users'),
+    audit:   roleCan(role, 'audit'),
+  };
+}
+function requireFeature(feature) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error:'Not authenticated' });
+    if (!roleCan(req.user.role, feature)) {
+      return res.status(403).json({ error:'Your role does not have access to this feature' });
+    }
+    next();
+  };
+}
+
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error:'No token' });
@@ -213,7 +246,7 @@ app.post('/auth/login', async (req, res) => {
   }
 
   const token = jwt.sign(authed, JWT_SECRET, { expiresIn:'12h' });
-  res.json({ token, name:authed.name, role:authed.role });
+  res.json({ token, name:authed.name, role:authed.role, permissions: permissionsFor(authed.role) });
 });
 
 // ── DOWC ───────────────────────────────────────────────────────────────────────
@@ -390,7 +423,7 @@ app.post('/users', requireAuth, requireAdmin, async (req, res) => {
     await pgQuery(`INSERT INTO users (username, password_hash, name, role, active)
                   VALUES ($1,$2,$3,$4,TRUE)
                   ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash, name=EXCLUDED.name, role=EXCLUDED.role`,
-      [uname, hash, name, role==='admin'?'admin':'sales']);
+      [uname, hash, name, ['admin','office','sales'].includes(role)?role:'sales']);
     await audit2(req.user.username, 'create', 'user', uname, { name, role });
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save user' }); }
@@ -403,7 +436,7 @@ app.put('/users/:username', requireAuth, requireAdmin, async (req, res) => {
     // Build dynamic update
     const sets = [], vals = []; let i = 1;
     if (name)            { sets.push(`name=$${i++}`); vals.push(name); }
-    if (role)            { sets.push(`role=$${i++}`); vals.push(role==='admin'?'admin':'sales'); }
+    if (role)            { sets.push(`role=$${i++}`); vals.push(['admin','office','sales'].includes(role)?role:'sales'); }
     if (active !== undefined) { sets.push(`active=$${i++}`); vals.push(!!active); }
     if (password)        {
       if (String(password).length < 6) return res.status(400).json({ error:'Password must be at least 6 characters' });
@@ -942,7 +975,7 @@ async function generateDeliveryReceipt(d) {
   return await pdfDoc.save();
 }
 
-app.post('/closing/generate', requireAuth, async (req, res) => {
+app.post('/closing/generate', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     const {formId, data:d} = req.body;
     const isIL = ['IL','il'].includes((d.state||d.bizState||'').trim());
@@ -1068,7 +1101,7 @@ app.post('/closing/generate', requireAuth, async (req, res) => {
   } catch(e){ console.error('Closing form error:',e); res.status(500).json({error:'Form generation failed: '+e.message}); }
 });
 
-app.post('/closing/generate-all', requireAuth, async (req, res) => {
+app.post('/closing/generate-all', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     const {data:d}=req.body;
     const isIL=['IL','il'].includes((d.state||d.bizState||'').trim());
@@ -1098,7 +1131,7 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
   }catch(e){console.error('Generate all error:',e);res.status(500).json({error:'Failed to generate package: '+e.message});}
 });
 
-app.post('/closing/save', requireAuth, async (req, res) => {
+app.post('/closing/save', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     const sheets=getSheetsClient(); const d=sanitizeObj(req.body); const SHEET='ClosingPackages';
     if (WRITE_TO_SHEETS) await ensureSheetTab(sheets, 'ClosingPackages');
@@ -1123,7 +1156,7 @@ app.post('/closing/save', requireAuth, async (req, res) => {
   }catch(e){console.error(e);res.status(500).json({error:'Failed to save closing package'});}
 });
 
-app.get('/closing', requireAuth, async (req, res) => {
+app.get('/closing', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     if (await usePg()) { return res.json(await DBR.readClosing()); }
     const sheets=getSheetsClient();
