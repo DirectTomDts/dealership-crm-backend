@@ -546,8 +546,9 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
     const pdfBytes = await pdfDoc.save();
     const safeName = (d.customerName||'Agreement').replace(/[^a-zA-Z0-9]/g,'_');
     const tdBuf = Buffer.from(pdfBytes);
-    DRIVE.uploadPdf('testdrive', `TestDrive_${safeName}_${d.date||'nodate'}`, tdBuf); // fire-and-forget
-    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="TestDrive_${safeName}_${d.date||'nodate'}.pdf"`});
+    const tdUp = await DRIVE.uploadPdf('testdrive', `TestDrive_${safeName}_${d.date||'nodate'}`, tdBuf);
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="TestDrive_${safeName}_${d.date||'nodate'}.pdf"`,
+      'X-Drive-Link': tdUp ? tdUp.link : '', 'Access-Control-Expose-Headers':'X-Drive-Link'});
     res.send(tdBuf);
   } catch(e) { console.error('Test drive PDF error:',e); res.status(500).json({ error:'PDF generation failed: '+e.message }); }
 });
@@ -820,8 +821,9 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     const pdfBytes=await pdfDoc.save();
     const safeName=(d.personalName||d.businessName||'BillOfSale').replace(/[^a-zA-Z0-9]/g,'_');
     const bosBuf = Buffer.from(pdfBytes);
-    DRIVE.uploadPdf('bos', `BillOfSale_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, bosBuf);
-    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}.pdf"`});
+    const bosUp = await DRIVE.uploadPdf('bos', `BillOfSale_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, bosBuf);
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}.pdf"`,
+      'X-Drive-Link': bosUp ? bosUp.link : '', 'Access-Control-Expose-Headers':'X-Drive-Link'});
     res.send(bosBuf);
   } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
 });
@@ -1089,8 +1091,9 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
     const mergedBytes=await merged.save();
     const safeName=(d.personalName||d.businessName||'closing').replace(/[^a-zA-Z0-9]/g,'_');
     const cpBuf = Buffer.from(mergedBytes);
-    DRIVE.uploadPdf('closing', `ClosingPackage_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, cpBuf);
-    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="ClosingPackage_${safeName}.pdf"`});
+    const cpUp = await DRIVE.uploadPdf('closing', `ClosingPackage_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, cpBuf);
+    res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="ClosingPackage_${safeName}.pdf"`,
+      'X-Drive-Link': cpUp ? cpUp.link : '', 'Access-Control-Expose-Headers':'X-Drive-Link'});
     res.send(cpBuf);
   }catch(e){console.error('Generate all error:',e);res.status(500).json({error:'Failed to generate package: '+e.message});}
 });

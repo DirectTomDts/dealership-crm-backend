@@ -88,4 +88,16 @@ async function uploadPdf(typeKey, filename, pdfBuffer) {
   }
 }
 
-module.exports = { uploadPdf, isConfigured };
+// Upload, then store the resulting link on a DB record (best-effort, never throws).
+// table: 'bills_of_sale' | 'closing_packages' ; idColumn defaults to 'id'.
+async function uploadAndLink(typeKey, filename, pdfBuffer, table, recordId) {
+  const result = await uploadPdf(typeKey, filename, pdfBuffer);
+  if (!result || !recordId) return result;
+  try {
+    const { query } = require('./db');
+    await query(`UPDATE ${table} SET drive_link=$1 WHERE id=$2`, [result.link, recordId]);
+  } catch (e) { console.warn('[drive] link store failed:', e.message); }
+  return result;
+}
+
+module.exports = { uploadPdf, uploadAndLink, isConfigured };

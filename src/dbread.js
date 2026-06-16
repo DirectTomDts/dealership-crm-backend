@@ -36,20 +36,20 @@ async function buildDealsByLead() {
   const push = (leadId, d) => { if (!leadId) return; (out[leadId] = out[leadId] || []).push(d); };
 
   const bos = await query(`
-    SELECT b.id, b.lead_id, b.bos_date, b.total,
+    SELECT b.id, b.lead_id, b.bos_date, b.total, b.drive_link,
            string_agg(u.unit, ', ') FILTER (WHERE u.unit <> '') AS units,
            string_agg(trim(concat_ws(' ', u.year, u.make, u.model)), ' | ') AS descs,
            string_agg(u.vin, ', ') FILTER (WHERE u.vin <> '') AS vins
     FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id = b.id
     WHERE b.lead_id IS NOT NULL
     GROUP BY b.id ORDER BY b.created_at DESC`);
-  for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'' });
+  for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'' });
 
   const td = await query(`SELECT * FROM test_drives WHERE lead_id IS NOT NULL ORDER BY created_at DESC`);
-  for (const r of td.rows) push(r.lead_id, { t:'Test Drive', d:r.drive_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'' });
+  for (const r of td.rows) push(r.lead_id, { t:'Test Drive', d:r.drive_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });
 
   const cp = await query(`SELECT * FROM closing_packages WHERE lead_id IS NOT NULL ORDER BY created_at DESC`);
-  for (const r of cp.rows) push(r.lead_id, { t:'Closing Package', d:r.cp_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'' });
+  for (const r of cp.rows) push(r.lead_id, { t:'Closing Package', d:r.cp_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });
 
   return out;
 }
@@ -71,7 +71,7 @@ async function readTestDrives() {
     date:r.drive_date||'', customerName:r.customer_name||'', phone:r.phone||'', address:r.address||'',
     city:r.city||'', state:r.state||'', zip:r.zip||'', dlNumber:r.dl_number||'', dlState:r.dl_state||'',
     unit:r.unit||'', make:r.make||'', model:r.model||'', vin:r.vin||'', plate:r.plate||'',
-    returnTime:r.return_time||'', salesperson:r.salesperson||'', leadId:r.lead_id||'',
+    returnTime:r.return_time||'', salesperson:r.salesperson||'', leadId:r.lead_id||'', driveLink:r.drive_link||'',
   }));
 }
 
@@ -104,7 +104,7 @@ async function readBillsOfSale() {
       titleFee:first.titleFee||'', docFee:first.docFee||'',
       depositAmount:b.deposit_amount||'', depositType:b.deposit_type||'', total:b.total||'',
       salesperson:b.salesperson||'', item1:first.item1||'', item2:first.item2||'', item3:first.item3||'',
-      item4:first.item4||'', leadId:b.lead_id||'', units,
+      item4:first.item4||'', leadId:b.lead_id||'', driveLink:b.drive_link||'', units,
     });
   }
   return out;
@@ -121,7 +121,7 @@ async function readClosing() {
     reportNumber:r.report_number||'', isLeased:r.is_leased,
     carrierName:r.carrier_name||'', carrierAddress:r.carrier_address||'', carrierCity:r.carrier_city||'',
     carrierState:r.carrier_state||'', carrierZip:r.carrier_zip||'', carrierPhone:r.carrier_phone||'',
-    role:r.role||'agent', bosId:r.bos_id||'', notes:r.notes||'',
+    role:r.role||'agent', bosId:r.bos_id||'', notes:r.notes||'', driveLink:r.drive_link||'',
   }));
 }
 

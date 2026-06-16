@@ -99,11 +99,11 @@ const mirrorLeadEnrich = safe('lead enrich', async (leadId, client) => {
 const mirrorTestDrive = safe('test drive', async (d, username) => {
   await query(`
     INSERT INTO test_drives (lead_id, drive_date, customer_name, phone, address, city, state, zip,
-      dl_number, dl_state, unit, make, model, vin, plate, return_time, salesperson)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+      dl_number, dl_state, unit, make, model, vin, plate, return_time, salesperson, drive_link)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
     [d.leadId||null, d.date||'', d.customerName||'', d.phone||'', d.address||'', d.city||'', d.state||'',
      d.zip||'', d.dlNumber||'', d.dlState||'', d.unit||'', d.make||'', d.model||'', d.vin||'',
-     d.plate||'', d.returnTime||'', d.salesperson||'']);
+     d.plate||'', d.returnTime||'', d.salesperson||'', d.driveLink||'']);
   await audit(username, 'create', 'test_drive', '', { customer: d.customerName, unit: d.unit });
 });
 
@@ -113,15 +113,16 @@ const mirrorBillOfSale = safe('bill of sale', async (id, d, username) => {
     await c.query(`
       INSERT INTO bills_of_sale (id, lead_id, bos_date, personal_name, business_name,
         address, city, state, zip, biz_address, biz_city, biz_state, biz_zip,
-        phone, biz_phone, email, dl_number, dl_state, deposit_amount, deposit_type, total, salesperson)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+        phone, biz_phone, email, dl_number, dl_state, deposit_amount, deposit_type, total, salesperson, drive_link)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       ON CONFLICT (id) DO UPDATE SET
         personal_name=EXCLUDED.personal_name, business_name=EXCLUDED.business_name,
-        total=EXCLUDED.total, salesperson=EXCLUDED.salesperson`,
+        total=EXCLUDED.total, salesperson=EXCLUDED.salesperson,
+        drive_link=CASE WHEN EXCLUDED.drive_link<>'' THEN EXCLUDED.drive_link ELSE bills_of_sale.drive_link END`,
       [id, d.leadId||null, d.date||'', d.personalName||'', d.businessName||'',
        d.address||'', d.city||'', d.state||'', d.zip||'', d.bizAddress||'', d.bizCity||'',
        d.bizState||'', d.bizZip||'', d.phone||'', d.bizPhone||'', d.email||'', d.dlNumber||'',
-       d.dlState||'', d.depositAmount||'', d.depositType||'', d.total||'', d.salesperson||'']);
+       d.dlState||'', d.depositAmount||'', d.depositType||'', d.total||'', d.salesperson||'', d.driveLink||'']);
 
     let units = (d.units && d.units.length) ? d.units : [{
       unit:d.unit, year:d.year, make:d.make, model:d.model, vin:d.vin, miles:d.miles, apu:d.apu,
@@ -154,16 +155,17 @@ const mirrorClosing = safe('closing package', async (id, d, username) => {
     INSERT INTO closing_packages (id, lead_id, bos_id, cp_date, personal_name, business_name,
       address, city, state, zip, phone, unit, year, make, model, vin, salesperson,
       usdot, mc_number, report_number, role, is_leased,
-      carrier_name, carrier_address, carrier_city, carrier_state, carrier_zip, carrier_phone, notes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+      carrier_name, carrier_address, carrier_city, carrier_state, carrier_zip, carrier_phone, notes, drive_link)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
     ON CONFLICT (id) DO UPDATE SET
-      personal_name=EXCLUDED.personal_name, business_name=EXCLUDED.business_name, notes=EXCLUDED.notes`,
+      personal_name=EXCLUDED.personal_name, business_name=EXCLUDED.business_name, notes=EXCLUDED.notes,
+      drive_link=CASE WHEN EXCLUDED.drive_link<>'' THEN EXCLUDED.drive_link ELSE closing_packages.drive_link END`,
     [id, d.leadId||null, d.bosId||null, d.date||'', d.personalName||'', d.businessName||'',
      d.address||'', d.city||'', d.state||'', d.zip||'', d.phone||'', d.unit||'', d.year||'',
      d.make||'', d.model||'', d.vin||'', d.salesperson||'', d.usdot||'', d.mcNumber||'',
      d.reportNumber||'', d.role||'agent', b(d.isLeased),
      d.carrierName||'', d.carrierAddress||'', d.carrierCity||'', d.carrierState||'',
-     d.carrierZip||'', d.carrierPhone||'', d.notes||'']);
+     d.carrierZip||'', d.carrierPhone||'', d.notes||'', d.driveLink||'']);
   await audit(username, 'create', 'closing_package', id, { customer: d.personalName||d.businessName });
 });
 
