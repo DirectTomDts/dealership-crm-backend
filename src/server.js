@@ -10,6 +10,7 @@ const DBR = require('./dbread');   // Phase 4 read layer
 const { isAvailable: pgAvailable } = require('./db');
 const { query: pgQuery } = require('./db');
 const bcrypt = require('bcryptjs'); // Phase 5: hashed passwords
+const DRIVE = require('./drive'); // Tier 3: archive PDFs to Shared Drive
 // READ_FROM controls where GET routes read. 'postgres' = read from DB, anything
 // else (or unset) = read from Google Sheets. Flip in Railway vars; no code change.
 const READ_FROM = (process.env.READ_FROM || 'sheets').toLowerCase();
@@ -544,8 +545,10 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
 
     const pdfBytes = await pdfDoc.save();
     const safeName = (d.customerName||'Agreement').replace(/[^a-zA-Z0-9]/g,'_');
+    const tdBuf = Buffer.from(pdfBytes);
+    DRIVE.uploadPdf('testdrive', `TestDrive_${safeName}_${d.date||'nodate'}`, tdBuf); // fire-and-forget
     res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="TestDrive_${safeName}_${d.date||'nodate'}.pdf"`});
-    res.send(Buffer.from(pdfBytes));
+    res.send(tdBuf);
   } catch(e) { console.error('Test drive PDF error:',e); res.status(500).json({ error:'PDF generation failed: '+e.message }); }
 });
 
@@ -816,8 +819,10 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 
     const pdfBytes=await pdfDoc.save();
     const safeName=(d.personalName||d.businessName||'BillOfSale').replace(/[^a-zA-Z0-9]/g,'_');
+    const bosBuf = Buffer.from(pdfBytes);
+    DRIVE.uploadPdf('bos', `BillOfSale_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, bosBuf);
     res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="BillOfSale_${safeName}.pdf"`});
-    res.send(Buffer.from(pdfBytes));
+    res.send(bosBuf);
   } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
 });
 
@@ -1083,8 +1088,10 @@ app.post('/closing/generate-all', requireAuth, async (req, res) => {
     }
     const mergedBytes=await merged.save();
     const safeName=(d.personalName||d.businessName||'closing').replace(/[^a-zA-Z0-9]/g,'_');
+    const cpBuf = Buffer.from(mergedBytes);
+    DRIVE.uploadPdf('closing', `ClosingPackage_${safeName}_${d.date||new Date().toISOString().split('T')[0]}`, cpBuf);
     res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="ClosingPackage_${safeName}.pdf"`});
-    res.send(Buffer.from(mergedBytes));
+    res.send(cpBuf);
   }catch(e){console.error('Generate all error:',e);res.status(500).json({error:'Failed to generate package: '+e.message});}
 });
 
