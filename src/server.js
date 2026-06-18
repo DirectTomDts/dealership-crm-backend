@@ -157,6 +157,26 @@ const fmtPhone = (p) => {
   return [d.slice(0,3), d.slice(3,6), d.slice(6,10)];
 };
 
+// Normalize closing data to the chosen identity (personal vs business).
+// When 'business', the form address fields are sourced from the business address
+// and the business name leads. Mutates and returns d.
+function applyClosingIdentity(d) {
+  if (!d) return d;
+  const identity = (d.identity || 'personal').toLowerCase();
+  if (identity === 'business') {
+    // Use business address for the address fields the forms read
+    if (d.bizAddress) d.address = d.bizAddress;
+    if (d.bizCity)    d.city    = d.bizCity;
+    if (d.bizState)   d.state   = d.bizState;
+    if (d.bizZip)     d.zip     = d.bizZip;
+    // Ensure businessName is present so name lines lead with the business
+    d._useBusiness = true;
+  } else {
+    d._useBusiness = false;
+  }
+  return d;
+}
+
 const agentLine = (name, company) => {
   if (name && company) return `${name}, agent for ${company}`;
   return name || company || '';
@@ -988,6 +1008,7 @@ async function generateDeliveryReceipt(d) {
 app.post('/closing/generate', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     const {formId, data:d} = req.body;
+    applyClosingIdentity(d);
     const isIL = ['IL','il'].includes((d.state||d.bizState||'').trim());
     const dateParts=(d.date||'').split('-');
     const [yr,mo,day]=dateParts.length===3?dateParts:['','',''];
@@ -1114,6 +1135,7 @@ app.post('/closing/generate', requireAuth, requireFeature('closing'), async (req
 app.post('/closing/generate-all', requireAuth, requireFeature('closing'), async (req, res) => {
   try {
     const {data:d}=req.body;
+    applyClosingIdentity(d);
     const isIL=['IL','il'].includes((d.state||d.bizState||'').trim());
     const forms=['rut7','dot','buyers','receipt'];
     if(isIL){forms.push('rt5');forms.push('lpoa');}
