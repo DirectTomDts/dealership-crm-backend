@@ -492,7 +492,7 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     // Pull the raw data we need
     const bos = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at FROM bills_of_sale')).rows;
     const leads = (await pgQuery('SELECT id, status, salesperson, created_at FROM leads')).rows;
-    const inv = (await pgQuery('SELECT unit, status, synced_at FROM inventory')).rows;
+    const inv = (await pgQuery('SELECT unit, status, date_added FROM inventory')).rows;
 
     // Units sold this month + gross revenue (by bos_date when present, else created_at)
     const inMonth = (r) => {
@@ -533,11 +533,18 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     const soldLeadIds = new Set(bos.map(r=>r.lead_id).filter(Boolean));
     const conversionRate = leads.length ? (soldLeadIds.size / leads.length * 100) : 0;
 
-    // Aging inventory: available units by how long since synced (proxy for time on lot)
+    // Aging inventory: available units bucketed by true days-on-lot (date_added)
     const available = inv.filter(u => !/sold|pending/i.test(u.status||''));
     const agingBuckets = { '0-30':0, '31-60':0, '61-90':0, '90+':0 };
-    // NOTE: synced_at resets on each sync, so this is a coarse proxy until we add a
-    // dedicated date_added column to inventory. Counts available units only.
+    let oldestDays = 0;
+    for (const u of available) {
+      const days = u.date_added ? Math.floor((Date.now()-new Date(u.date_added).getTime())/86400000) : 0;
+      if (days > oldestDays) oldestDays = days;
+      if (days <= 30) agingBuckets['0-30']++;
+      else if (days <= 60) agingBuckets['31-60']++;
+      else if (days <= 90) agingBuckets['61-90']++;
+      else agingBuckets['90+']++;
+    }
     const availableCount = available.length;
 
     res.json({
@@ -549,6 +556,8 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
       totalLeads: leads.length,
       soldLeads: soldLeadIds.size,
       availableInventory: availableCount,
+      agingBuckets,
+      oldestDays,
       totalBos: bos.length,
     });
   } catch(e) { console.error('dashboard error', e); res.status(500).json({ error:'Failed to load dashboard' }); }
