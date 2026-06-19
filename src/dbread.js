@@ -26,6 +26,8 @@ async function readLeads() {
     bizAddress: r.biz_address||'', bizCity: r.biz_city||'', bizState: r.biz_state||'',
     bizZip: r.biz_zip||'', bizPhone: r.biz_phone||'', dlNumber: r.dl_number||'', dlState: r.dl_state||'',
     deals: deals[r.id] || [],
+    updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : '',
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : '',
   }));
 }
 

@@ -117,6 +117,7 @@ const FEATURE_ACCESS = {
   closing: ['office', 'admin'],   // Sales cannot access closing package
   users:   ['admin'],
   audit:   ['admin'],
+  dashboard: ['admin'],
   // leads, testdrive, billsofsale, inventory: open to all logged-in roles
 };
 function roleCan(role, feature) {
@@ -131,6 +132,7 @@ function permissionsFor(role) {
     closing: roleCan(role, 'closing'),
     users:   roleCan(role, 'users'),
     audit:   roleCan(role, 'audit'),
+    dashboard: roleCan(role, 'dashboard'),
   };
 }
 function requireFeature(feature) {
@@ -480,6 +482,78 @@ app.delete('/users/:username', requireAuth, requireAdmin, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to deactivate user' }); }
 });
 
+// ── DASHBOARD STATS (admin only) ──────────────────────────────────────────────
+app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+    const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; };
+
+    // Pull the raw data we need
+    const bos = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at FROM bills_of_sale')).rows;
+    const leads = (await pgQuery('SELECT id, status, salesperson, created_at FROM leads')).rows;
+    const inv = (await pgQuery('SELECT unit, status, synced_at FROM inventory')).rows;
+
+    // Units sold this month + gross revenue (by bos_date when present, else created_at)
+    const inMonth = (r) => {
+      const d = (r.bos_date && r.bos_date.length>=7) ? r.bos_date : (r.created_at ? new Date(r.created_at).toISOString().split('T')[0] : '');
+      return d >= monthStart;
+    };
+    const monthBos = bos.filter(inMonth);
+    const unitsSoldMonth = monthBos.length;
+    const grossMonth = monthBos.reduce((s,r)=>s+num(r.total),0);
+    const grossAll = bos.reduce((s,r)=>s+num(r.total),0);
+
+    // Sales per person (this month, by count + revenue)
+    const byPerson = {};
+    for (const r of monthBos) {
+      const p = r.salesperson || '—';
+      byPerson[p] = byPerson[p] || { name:p, count:0, revenue:0 };
+      byPerson[p].count++; byPerson[p].revenue += num(r.total);
+    }
+
+    // Average days-to-sale: lead.created_at → first BOS created_at for that lead
+    const firstBosByLead = {};
+    for (const r of bos) {
+      if (!r.lead_id) continue;
+      const t = r.created_at ? new Date(r.created_at).getTime() : 0;
+      if (!firstBosByLead[r.lead_id] || t < firstBosByLead[r.lead_id]) firstBosByLead[r.lead_id] = t;
+    }
+    let daysList = [];
+    for (const l of leads) {
+      const sold = firstBosByLead[l.id];
+      if (sold && l.created_at) {
+        const days = (sold - new Date(l.created_at).getTime()) / 86400000;
+        if (days >= 0 && days < 3650) daysList.push(days);
+      }
+    }
+    const avgDaysToSale = daysList.length ? (daysList.reduce((a,b)=>a+b,0)/daysList.length) : null;
+
+    // Conversion rate: leads with a linked BOS / total leads
+    const soldLeadIds = new Set(bos.map(r=>r.lead_id).filter(Boolean));
+    const conversionRate = leads.length ? (soldLeadIds.size / leads.length * 100) : 0;
+
+    // Aging inventory: available units by how long since synced (proxy for time on lot)
+    const available = inv.filter(u => !/sold|pending/i.test(u.status||''));
+    const agingBuckets = { '0-30':0, '31-60':0, '61-90':0, '90+':0 };
+    // NOTE: synced_at resets on each sync, so this is a coarse proxy until we add a
+    // dedicated date_added column to inventory. Counts available units only.
+    const availableCount = available.length;
+
+    res.json({
+      month: monthStart.slice(0,7),
+      unitsSoldMonth, grossMonth, grossAll,
+      salesByPerson: Object.values(byPerson).sort((a,b)=>b.revenue-a.revenue),
+      avgDaysToSale,
+      conversionRate,
+      totalLeads: leads.length,
+      soldLeads: soldLeadIds.size,
+      availableInventory: availableCount,
+      totalBos: bos.length,
+    });
+  } catch(e) { console.error('dashboard error', e); res.status(500).json({ error:'Failed to load dashboard' }); }
+});
+
 // ── AUDIT LOG (admin only, with filters) ──────────────────────────────────────
 app.get('/audit', requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -554,9 +628,25 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
     };
     const ln = (yPos, x1=M, x2=width-M) => page.drawLine({ start:{x:x1,y:yPos}, end:{x:x2,y:yPos}, thickness:0.5, color:rgb(0.5,0.5,0.5) });
 
-    dt('TEST DRIVE AGREEMENT', M, y, {bold:true, size:15});
-    y-=6; dt('Direct Truck Sales Inc.  |  15w740 N. Frontage Rd, Burr Ridge, Illinois', M, y-8, {size:8, italic:true});
-    y-=22; ln(y); y-=14;
+    // ── Branded header: logo + contact block, matching the Bill of Sale ──────
+    try {
+      const img = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
+      const dims = img.scaleToFit(130,46);
+      page.drawImage(img,{ x:M, y:y-dims.height+8, width:dims.width, height:dims.height });
+    } catch(e){}
+    const ax = width - M - 165;
+    dt('Direct Truck Sales Inc.', ax, y, {bold:true, size:9});
+    dt('15w740 N. Frontage Rd, Ste 2', ax, y-12, {size:8});
+    dt('Burr Ridge, IL 60527', ax, y-23, {size:8});
+    dt('630-701-1000', ax, y-34, {size:8});
+    page.drawText('Sales@Direct-Truck.com', { x:ax, y:y-45, size:8, font, color:rgb(0,0.3,0.7) });
+    page.drawText('Finance@Direct-Truck.com', { x:ax, y:y-56, size:8, font, color:rgb(0,0.3,0.7) });
+    y -= 68;
+    page.drawRectangle({ x:M, y:y-14, width:width-M*2, height:20, color:rgb(0.12,0.12,0.12) });
+    page.drawText('TEST DRIVE AGREEMENT', { x:width/2-72, y:y-8, size:12, font:fontBold, color:rgb(1,1,1) });
+    dt('Date: '+(d.date||''), width-M-104, y-8, {size:8.5});
+    y -= 28;
+    ln(y); y-=14;
     dt('The undersigned acknowledges receiving the following vehicle for test drive purposes:', M, y, {size:9, italic:true});
     y-=18;
 
