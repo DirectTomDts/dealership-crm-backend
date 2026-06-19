@@ -13,7 +13,7 @@ const { query } = require('./db');
 // rowIndex is synthesized from ordinal position for backward-compat, but lead
 // updates now resolve by id server-side, so its exact value no longer matters.
 async function readLeads() {
-  const { rows } = await query(`SELECT * FROM leads ORDER BY created_at ASC`);
+  const { rows } = await query(`SELECT * FROM leads WHERE deleted_at IS NULL ORDER BY created_at ASC`);
   // Pull all deal-type records once, group by lead_id, to rebuild the "deals" array
   const deals = await buildDealsByLead();
   return rows.map((r, i) => ({
@@ -43,14 +43,14 @@ async function buildDealsByLead() {
            string_agg(trim(concat_ws(' ', u.year, u.make, u.model)), ' | ') AS descs,
            string_agg(u.vin, ', ') FILTER (WHERE u.vin <> '') AS vins
     FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id = b.id
-    WHERE b.lead_id IS NOT NULL
+    WHERE b.lead_id IS NOT NULL AND b.deleted_at IS NULL
     GROUP BY b.id ORDER BY b.created_at DESC`);
   for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'' });
 
-  const td = await query(`SELECT * FROM test_drives WHERE lead_id IS NOT NULL ORDER BY created_at DESC`);
+  const td = await query(`SELECT * FROM test_drives WHERE lead_id IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC`);
   for (const r of td.rows) push(r.lead_id, { t:'Test Drive', d:r.drive_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });
 
-  const cp = await query(`SELECT * FROM closing_packages WHERE lead_id IS NOT NULL ORDER BY created_at DESC`);
+  const cp = await query(`SELECT * FROM closing_packages WHERE lead_id IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC`);
   for (const r of cp.rows) push(r.lead_id, { t:'Closing Package', d:r.cp_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });
 
   return out;
@@ -68,7 +68,7 @@ async function readInventory() {
 
 // ── TEST DRIVE HISTORY ───────────────────────────────────────────────────────
 async function readTestDrives() {
-  const { rows } = await query(`SELECT * FROM test_drives ORDER BY created_at DESC`);
+  const { rows } = await query(`SELECT * FROM test_drives WHERE deleted_at IS NULL ORDER BY created_at DESC`);
   return rows.map(r => ({
     date:r.drive_date||'', customerName:r.customer_name||'', phone:r.phone||'', address:r.address||'',
     city:r.city||'', state:r.state||'', zip:r.zip||'', dlNumber:r.dl_number||'', dlState:r.dl_state||'',
@@ -79,7 +79,7 @@ async function readTestDrives() {
 
 // ── BILLS OF SALE ────────────────────────────────────────────────────────────
 async function readBillsOfSale() {
-  const { rows } = await query(`SELECT * FROM bills_of_sale ORDER BY created_at DESC`);
+  const { rows } = await query(`SELECT * FROM bills_of_sale WHERE deleted_at IS NULL ORDER BY created_at DESC`);
   const out = [];
   for (const b of rows) {
     const u = await query(`SELECT * FROM bos_units WHERE bos_id=$1 ORDER BY unit_number ASC`, [b.id]);
@@ -114,7 +114,7 @@ async function readBillsOfSale() {
 
 // ── CLOSING PACKAGES ─────────────────────────────────────────────────────────
 async function readClosing() {
-  const { rows } = await query(`SELECT * FROM closing_packages ORDER BY created_at DESC`);
+  const { rows } = await query(`SELECT * FROM closing_packages WHERE deleted_at IS NULL ORDER BY created_at DESC`);
   return rows.map(r => ({
     id:r.id, date:r.cp_date||'', personalName:r.personal_name||'', businessName:r.business_name||'',
     address:r.address||'', city:r.city||'', state:r.state||'', zip:r.zip||'', phone:r.phone||'',

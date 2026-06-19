@@ -30,6 +30,22 @@ function safe(label, fn) {
   };
 }
 
+// Record field-level changes for key fields. Compares incoming values to the
+// current row and writes one field_history row per changed tracked field.
+async function trackFieldChanges(entity, entityId, currentRow, incoming, fields, username) {
+  try {
+    for (const [field, getCurrent, getNew] of fields) {
+      const oldV = (getCurrent(currentRow) ?? '').toString();
+      const newV = (getNew(incoming) ?? '').toString();
+      if (oldV !== newV) {
+        await query(
+          'INSERT INTO field_history (entity, entity_id, field, old_value, new_value, username) VALUES ($1,$2,$3,$4,$5,$6)',
+          [entity, String(entityId), field, oldV, newV, username || 'system']);
+      }
+    }
+  } catch(e) { console.warn('[field-history]', e.message); }
+}
+
 const b = (v) => v === true || String(v).toLowerCase() === 'true' || String(v).toLowerCase() === 'yes';
 
 // ── LEAD (insert) ────────────────────────────────────────────────────────────
@@ -54,6 +70,9 @@ const mirrorLeadInsert = safe('lead insert', async (id, l, username) => {
 // ── LEAD (update) ────────────────────────────────────────────────────────────
 const mirrorLeadUpdate = safe('lead update', async (l, username) => {
   if (!l.id) return;
+  // Capture the current row first so we can record field-level changes
+  let cur = null;
+  try { const r = await query('SELECT * FROM leads WHERE id=$1', [l.id]); cur = r.rows[0] || null; } catch(e) {}
   await query(`
     UPDATE leads SET first_name=$2, last_name=$3, company=$4, phone=$5, email=$6, unit=$7,
       source=$8, status=$9, salesperson=$10, followup=$11, notes=$12, archived=$13,
@@ -64,6 +83,16 @@ const mirrorLeadUpdate = safe('lead update', async (l, username) => {
      l.status||'Prospect', l.sales||'', l.followup||'', l.notes||'', b(l.status==='Sold'||l.status==='Dead'),
      l.address||'', l.city||'', l.state||'', l.zip||'', l.bizAddress||'', l.bizCity||'', l.bizState||'',
      l.bizZip||'', l.bizPhone||'', l.dlNumber||'', l.dlState||'']);
+  if (cur) {
+    await trackFieldChanges('lead', l.id, cur, l, [
+      ['status',      r=>r.status,      n=>n.status||'Prospect'],
+      ['salesperson', r=>r.salesperson, n=>n.sales||''],
+      ['phone',       r=>r.phone,       n=>n.phone||''],
+      ['unit',        r=>r.unit,        n=>n.unit||''],
+      ['followup',    r=>r.followup,    n=>n.followup||''],
+      ['company',     r=>r.company,     n=>n.company||''],
+    ], username);
+  }
   await audit(username, 'update', 'lead', l.id, null);
 });
 
@@ -109,6 +138,9 @@ const mirrorTestDrive = safe('test drive', async (d, username) => {
 
 // ── BILL OF SALE (+ units) ───────────────────────────────────────────────────
 const mirrorBillOfSale = safe('bill of sale', async (id, d, username) => {
+  // Capture existing total (if any) for field-history before upsert
+  let prevTotal = null;
+  try { const r = await query('SELECT total FROM bills_of_sale WHERE id=$1', [id]); if (r.rows[0]) prevTotal = r.rows[0].total; } catch(e) {}
   await withTransaction(async (c) => {
     await c.query(`
       INSERT INTO bills_of_sale (id, lead_id, bos_date, personal_name, business_name,
@@ -147,6 +179,13 @@ const mirrorBillOfSale = safe('bill of sale', async (id, d, username) => {
     }
   });
   await audit(username, 'create', 'bill_of_sale', id, { total: d.total, customer: d.personalName||d.businessName });
+  // Field history: record price/total changes on existing bills
+  if (prevTotal !== null && String(prevTotal) !== String(d.total||'')) {
+    try {
+      await query('INSERT INTO field_history (entity, entity_id, field, old_value, new_value, username) VALUES ($1,$2,$3,$4,$5,$6)',
+        ['bill_of_sale', String(id), 'total', String(prevTotal), String(d.total||''), username||'system']);
+    } catch(e) { console.warn('[field-history bos]', e.message); }
+  }
 });
 
 // ── CLOSING PACKAGE ──────────────────────────────────────────────────────────

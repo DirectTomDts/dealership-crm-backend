@@ -118,6 +118,7 @@ const FEATURE_ACCESS = {
   users:   ['admin'],
   audit:   ['admin'],
   dashboard: ['admin'],
+  trash: ['admin'],
   // leads, testdrive, billsofsale, inventory: open to all logged-in roles
 };
 function roleCan(role, feature) {
@@ -482,6 +483,144 @@ app.delete('/users/:username', requireAuth, requireAdmin, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to deactivate user' }); }
 });
 
+// ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
+app.get('/search', requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json([]);
+    const term = '%' + q.toLowerCase() + '%';
+    const digits = q.replace(/\D/g, '');
+    const phoneTerm = digits.length >= 3 ? '%' + digits + '%' : '%__nomatch__%';
+    const results = [];
+
+    // Leads
+    const leads = (await pgQuery(`
+      SELECT id, first_name, last_name, company, phone, unit, status FROM leads
+      WHERE archived = FALSE AND (
+        lower(first_name) LIKE $1 OR lower(last_name) LIKE $1 OR lower(company) LIKE $1
+        OR regexp_replace(phone,'[^0-9]','','g') LIKE $2 OR lower(unit) LIKE $1
+        OR lower(first_name || ' ' || last_name) LIKE $1)
+      LIMIT 12`, [term, phoneTerm])).rows;
+    for (const l of leads) results.push({
+      type: 'lead', id: l.id,
+      title: `${l.first_name||''} ${l.last_name||''}`.trim() || l.company || '(no name)',
+      sub: [l.company, l.phone, l.unit].filter(Boolean).join(' · '),
+      tag: l.status || 'Lead',
+    });
+
+    // Inventory (unit / make / model / VIN)
+    const inv = (await pgQuery(`
+      SELECT unit, year, make, model, vin, status FROM inventory
+      WHERE lower(unit) LIKE $1 OR lower(make) LIKE $1 OR lower(model) LIKE $1
+        OR lower(vin) LIKE $1 OR lower(year) LIKE $1
+      LIMIT 12`, [term])).rows;
+    for (const u of inv) results.push({
+      type: 'inventory', id: u.unit,
+      title: `${u.year||''} ${u.make||''} ${u.model||''}`.trim() || u.unit,
+      sub: [`Unit ${u.unit}`, u.vin ? 'VIN '+u.vin : ''].filter(Boolean).join(' · '),
+      tag: u.status || 'Inventory',
+    });
+
+    // Bills of sale
+    const bos = (await pgQuery(`
+      SELECT b.id, b.personal_name, b.business_name, b.total, b.lead_id,
+        string_agg(u.vin,', ') FILTER (WHERE u.vin<>'') AS vins,
+        string_agg(u.unit,', ') FILTER (WHERE u.unit<>'') AS units
+      FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id=b.id
+      WHERE lower(b.personal_name) LIKE $1 OR lower(b.business_name) LIKE $1
+        OR lower(u.vin) LIKE $1 OR lower(u.unit) LIKE $1
+      GROUP BY b.id LIMIT 12`, [term])).rows;
+    for (const b of bos) results.push({
+      type: 'bill_of_sale', id: b.id, leadId: b.lead_id || '',
+      title: b.personal_name || b.business_name || b.id,
+      sub: [b.units ? 'Unit '+b.units : '', b.total ? '$'+Number(b.total).toLocaleString() : ''].filter(Boolean).join(' · '),
+      tag: 'Bill of Sale',
+    });
+
+    // Closing packages
+    const cp = (await pgQuery(`
+      SELECT id, personal_name, business_name, unit, vin, lead_id FROM closing_packages
+      WHERE lower(personal_name) LIKE $1 OR lower(business_name) LIKE $1
+        OR lower(unit) LIKE $1 OR lower(vin) LIKE $1
+      LIMIT 12`, [term])).rows;
+    for (const c of cp) results.push({
+      type: 'closing_package', id: c.id, leadId: c.lead_id || '',
+      title: c.personal_name || c.business_name || c.id,
+      sub: [c.unit ? 'Unit '+c.unit : '', c.vin ? 'VIN '+c.vin : ''].filter(Boolean).join(' · '),
+      tag: 'Closing',
+    });
+
+    // Test drives
+    const td = (await pgQuery(`
+      SELECT id, customer_name, unit, vin, lead_id, drive_date FROM test_drives
+      WHERE lower(customer_name) LIKE $1 OR lower(unit) LIKE $1 OR lower(vin) LIKE $1
+      LIMIT 12`, [term])).rows;
+    for (const t of td) results.push({
+      type: 'test_drive', id: String(t.id), leadId: t.lead_id || '',
+      title: t.customer_name || '(test drive)',
+      sub: [t.unit ? 'Unit '+t.unit : '', t.drive_date || ''].filter(Boolean).join(' · '),
+      tag: 'Test Drive',
+    });
+
+    res.json(results);
+  } catch(e) { console.error('search error', e); res.status(500).json({ error:'Search failed' }); }
+});
+
+// ── SOFT DELETE / RESTORE / TRASH ─────────────────────────────────────────────
+const DELETABLE = {
+  lead: 'leads', bill_of_sale: 'bills_of_sale',
+  closing_package: 'closing_packages', test_drive: 'test_drives',
+};
+
+app.post('/trash/:entity/:id', requireAuth, async (req, res) => {
+  try {
+    const table = DELETABLE[req.params.entity];
+    if (!table) return res.status(400).json({ error:'Unknown record type' });
+    await pgQuery(`UPDATE ${table} SET deleted_at=now(), deleted_by=$2 WHERE id=$1`,
+      [req.params.id, req.user.username]);
+    await audit2(req.user.username, 'delete', req.params.entity, req.params.id, { soft:true });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to delete' }); }
+});
+
+app.post('/restore/:entity/:id', requireAuth, async (req, res) => {
+  try {
+    const table = DELETABLE[req.params.entity];
+    if (!table) return res.status(400).json({ error:'Unknown record type' });
+    await pgQuery(`UPDATE ${table} SET deleted_at=NULL, deleted_by=NULL WHERE id=$1`, [req.params.id]);
+    await audit2(req.user.username, 'restore', req.params.entity, req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to restore' }); }
+});
+
+// List everything in the trash (admin only)
+app.get('/trash', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const out = [];
+    const leads = (await pgQuery(`SELECT id, first_name, last_name, company, deleted_at, deleted_by FROM leads WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC`)).rows;
+    for (const l of leads) out.push({ type:'lead', id:l.id, title:`${l.first_name||''} ${l.last_name||''}`.trim()||l.company||l.id, deletedAt:l.deleted_at, deletedBy:l.deleted_by });
+    const bos = (await pgQuery(`SELECT id, personal_name, business_name, total, deleted_at, deleted_by FROM bills_of_sale WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC`)).rows;
+    for (const b of bos) out.push({ type:'bill_of_sale', id:b.id, title:(b.personal_name||b.business_name||b.id)+(b.total?' · $'+Number(b.total).toLocaleString():''), deletedAt:b.deleted_at, deletedBy:b.deleted_by });
+    const cp = (await pgQuery(`SELECT id, personal_name, business_name, deleted_at, deleted_by FROM closing_packages WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC`)).rows;
+    for (const c of cp) out.push({ type:'closing_package', id:c.id, title:c.personal_name||c.business_name||c.id, deletedAt:c.deleted_at, deletedBy:c.deleted_by });
+    const td = (await pgQuery(`SELECT id, customer_name, unit, deleted_at, deleted_by FROM test_drives WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC`)).rows;
+    for (const t of td) out.push({ type:'test_drive', id:String(t.id), title:(t.customer_name||'Test drive')+(t.unit?' · '+t.unit:''), deletedAt:t.deleted_at, deletedBy:t.deleted_by });
+    out.sort((a,b)=> new Date(b.deletedAt) - new Date(a.deletedAt));
+    res.json(out);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load trash' }); }
+});
+
+// Field-level edit history for a record
+app.get('/history/:entity/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(
+      `SELECT field, old_value, new_value, username, at FROM field_history
+       WHERE entity=$1 AND entity_id=$2 ORDER BY at DESC LIMIT 100`,
+      [req.params.entity, req.params.id]);
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load history' }); }
+});
+
 // ── DASHBOARD STATS (admin only) ──────────────────────────────────────────────
 app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -491,7 +630,7 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
 
     // Pull the raw data we need
     const bos = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at FROM bills_of_sale')).rows;
-    const leads = (await pgQuery('SELECT id, status, salesperson, created_at FROM leads')).rows;
+    const leads = (await pgQuery('SELECT id, status, salesperson, source, created_at FROM leads')).rows;
     const inv = (await pgQuery('SELECT unit, status, date_added FROM inventory')).rows;
 
     // Units sold this month + gross revenue (by bos_date when present, else created_at)
@@ -533,6 +672,20 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     const soldLeadIds = new Set(bos.map(r=>r.lead_id).filter(Boolean));
     const conversionRate = leads.length ? (soldLeadIds.size / leads.length * 100) : 0;
 
+    // Lead-source conversion: per source, count leads, conversions, and revenue
+    const revenueByLead = {};
+    for (const r of bos) { if (r.lead_id) revenueByLead[r.lead_id] = (revenueByLead[r.lead_id]||0) + num(r.total); }
+    const bySource = {};
+    for (const l of leads) {
+      const s = (l.source && l.source.trim()) ? l.source.trim() : 'Unknown';
+      bySource[s] = bySource[s] || { source:s, leads:0, converted:0, revenue:0 };
+      bySource[s].leads++;
+      if (soldLeadIds.has(l.id)) { bySource[s].converted++; bySource[s].revenue += (revenueByLead[l.id]||0); }
+    }
+    const leadSources = Object.values(bySource).map(s => ({
+      ...s, rate: s.leads ? (s.converted / s.leads * 100) : 0
+    })).sort((a,b) => b.leads - a.leads);
+
     // Aging inventory: available units bucketed by true days-on-lot (date_added)
     const available = inv.filter(u => !/sold|pending/i.test(u.status||''));
     const agingBuckets = { '0-30':0, '31-60':0, '61-90':0, '90+':0 };
@@ -558,6 +711,7 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
       availableInventory: availableCount,
       agingBuckets,
       oldestDays,
+      leadSources,
       totalBos: bos.length,
     });
   } catch(e) { console.error('dashboard error', e); res.status(500).json({ error:'Failed to load dashboard' }); }
