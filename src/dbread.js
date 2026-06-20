@@ -63,6 +63,7 @@ async function readInventory() {
     unit:r.unit||'', year:r.year||'', make:r.make||'', model:r.model||'', hours:r.hours||'',
     miles:r.miles||'', apu:r.apu||'', color:r.color||'', ratio:r.ratio||'', hp:r.hp||'',
     listPrice:r.list_price||'', salePrice:r.sale_price||'', status:r.status||'', vin:r.vin||'',
+    cost:r.cost||'', profit:r.profit||'',
   }));
 }
 

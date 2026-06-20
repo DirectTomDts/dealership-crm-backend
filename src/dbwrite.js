@@ -214,16 +214,16 @@ const mirrorInventory = safe('inventory sync', async (items) => {
     if (!r.unit) continue;
     await query(`
       INSERT INTO inventory (unit, year, make, model, hours, miles, apu, color, ratio, hp,
-        list_price, sale_price, status, vin, synced_at, date_added)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now(), now())
+        list_price, sale_price, status, vin, cost, profit, synced_at, date_added)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, now(), now())
       ON CONFLICT (unit) DO UPDATE SET year=EXCLUDED.year, make=EXCLUDED.make, model=EXCLUDED.model,
         hours=EXCLUDED.hours, miles=EXCLUDED.miles, apu=EXCLUDED.apu, color=EXCLUDED.color,
         ratio=EXCLUDED.ratio, hp=EXCLUDED.hp, list_price=EXCLUDED.list_price, sale_price=EXCLUDED.sale_price,
-        status=EXCLUDED.status, vin=EXCLUDED.vin, synced_at=now()`,
+        status=EXCLUDED.status, vin=EXCLUDED.vin, cost=EXCLUDED.cost, profit=EXCLUDED.profit, synced_at=now()`,
       // NOTE: date_added is intentionally NOT in the UPDATE clause — it's set once
       // on first insert and preserved thereafter, so days-on-lot stays accurate.
       [r.unit, r.year||'', r.make||'', r.model||'', r.hours||'', r.miles||'', r.apu||'', r.color||'',
-       r.ratio||'', r.hp||'', r.listPrice||'', r.salePrice||'', r.status||'', r.vin||'']);
+       r.ratio||'', r.hp||'', r.listPrice||'', r.salePrice||'', r.status||'', r.vin||'', r.cost||'', r.profit||'']);
   }
 });
 

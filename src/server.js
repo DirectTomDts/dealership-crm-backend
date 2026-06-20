@@ -43,7 +43,10 @@ const JWT_SECRET   = process.env.JWT_SECRET || 'dts-crm-default-secret-change-in
 if (!process.env.JWT_SECRET) { console.warn('WARNING: JWT_SECRET env var not set — using default. Set this in Railway for security.'); }
 const SHEET_ID     = process.env.SHEET_ID;
 const SHEET_NAME   = process.env.SHEET_NAME || 'Sheet1';
-const INV_SHEET_ID = '1_R2mmi6O_KQW1mSd1Nu26fJDwrXKtRwH9vTwGnA2fN4';
+const INV_SHEET_ID = process.env.INV_SHEET_ID || '1_R2mmi6O_KQW1mSd1Nu26fJDwrXKtRwH9vTwGnA2fN4';
+const INV_SHEET_TAB = process.env.INV_SHEET_TAB || 'Sheet1';
+const PURCHASE_HISTORY_SHEET_ID = process.env.PURCHASE_HISTORY_SHEET_ID || '';
+const PURCHASE_HISTORY_TAB = process.env.PURCHASE_HISTORY_TAB || 'Sheet1';
 const FORMS_DIR    = path.join(__dirname, '..', 'forms');
 
 const USERS = [
@@ -119,6 +122,8 @@ const FEATURE_ACCESS = {
   audit:   ['admin'],
   dashboard: ['admin'],
   trash: ['admin'],
+  inventory_profit: ['sales_lead','office','admin'],  // Don + up can reveal profit
+  inventory_cost:   ['office','admin'],               // only office/admin see cost
   // leads, testdrive, billsofsale, inventory: open to all logged-in roles
 };
 function roleCan(role, feature) {
@@ -134,6 +139,8 @@ function permissionsFor(role) {
     users:   roleCan(role, 'users'),
     audit:   roleCan(role, 'audit'),
     dashboard: roleCan(role, 'dashboard'),
+    inventoryProfit: roleCan(role, 'inventory_profit'),
+    inventoryCost: roleCan(role, 'inventory_cost'),
   };
 }
 function requireFeature(feature) {
@@ -178,6 +185,70 @@ function applyClosingIdentity(d) {
     d._useBusiness = false;
   }
   return d;
+}
+
+// ── INVENTORY COLUMN MAPPING (header-based, role-filtered) ────────────────────
+// Maps a sheet's header row to canonical field names by fuzzy keyword match, so
+// the real inventory sheet works regardless of column order or extra columns.
+function buildInvHeaderMap(headerRow) {
+  const map = {}; // canonical field -> column index
+  // exact-match keys first (prevents 'price'/'trans' cross-matches), then contains.
+  const want = {
+    unit:        { exact:['unit','stock','stk'],            has:['unit','stock'] },
+    year:        { exact:['year','yr'],                     has:['year'] },
+    make:        { exact:['make'],                          has:['make'] },
+    model:       { exact:['model'],                         has:['model'] },
+    hours:       { exact:['hours','hrs'],                   has:['hour'] },
+    miles:       { exact:['miles','mileage'],               has:['mile','odometer'] },
+    trans:       { exact:['trans','transmission'],          has:['transmission'] },
+    apu:         { exact:['apu'],                           has:['apu'] },
+    vin:         { exact:['vin'],                           has:['vin'] },
+    color:       { exact:['color','colour'],                has:['color','colour'] },
+    ratio:       { exact:['ratio'],                         has:['ratio','rear'] },
+    hp:          { exact:['hp','horsepower'],               has:['horsepower'] },
+    purchaseP:   { exact:['purchase p','purchase price','purchase'], has:['purchase'] },
+    transport:   { exact:['transport','freight','shipping'],has:['transport','freight'] },
+    repairDot:   { exact:['repair/dot','repair','dot'],     has:['repair','dot'] },
+    cleaningWarr:{ exact:['cleaning& warr','cleaning&warr','cleaning'], has:['cleaning','warr'] },
+    docsFee:     { exact:['docs fee','doc fee','docs'],     has:['docs fee','doc fee'] },
+    sellPrice:   { exact:['sell price','sale price','selling'], has:['sell'] },
+    profit:      { exact:['profit','margin','gross'],       has:['profit','margin'] },
+    listPrice:   { exact:['list price','list','asking','retail'], has:['list'] },
+    status:      { exact:['status'],                        has:['status'] },
+  };
+  const headers = (headerRow||[]).map(h => String(h||'').trim().toLowerCase());
+  // Pass 1: exact header matches
+  for (const [field, cfg] of Object.entries(want)) {
+    for (let i=0;i<headers.length;i++) {
+      if (map[field]!=null) break;
+      if (Object.values(map).includes(i)) continue;
+      if (cfg.exact.includes(headers[i])) { map[field]=i; break; }
+    }
+  }
+  // Pass 2: contains matches for anything still unmapped
+  for (const [field, cfg] of Object.entries(want)) {
+    if (map[field]!=null) continue;
+    for (let i=0;i<headers.length;i++) {
+      if (Object.values(map).includes(i)) continue;
+      if (cfg.has.some(k => headers[i].includes(k))) { map[field]=i; break; }
+    }
+  }
+  return map;
+}
+
+// Safe field set every role may see
+const INV_SAFE_FIELDS = ['unit','year','make','model','hours','miles','trans','apu','color','ratio','hp','vin','status','listPrice','salePrice'];
+
+// Build a row object filtered to what this role is allowed to see.
+function invRowForRole(rowObj, role) {
+  const out = {};
+  for (const f of INV_SAFE_FIELDS) out[f] = rowObj[f] || '';
+  if (roleCan(role, 'inventory_profit')) out.profit = rowObj.profit || '';
+  if (roleCan(role, 'inventory_cost')) {
+    out.purchaseP = rowObj.purchaseP || '';
+    out.reconditioning = rowObj.reconditioning || '';  // combined recon total
+  }
+  return out;
 }
 
 const agentLine = (name, company) => {
@@ -445,7 +516,7 @@ app.post('/users', requireAuth, requireAdmin, async (req, res) => {
     await pgQuery(`INSERT INTO users (username, password_hash, name, role, active)
                   VALUES ($1,$2,$3,$4,TRUE)
                   ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash, name=EXCLUDED.name, role=EXCLUDED.role`,
-      [uname, hash, name, ['admin','office','sales'].includes(role)?role:'sales']);
+      [uname, hash, name, ['admin','office','sales','sales_lead'].includes(role)?role:'sales']);
     await audit2(req.user.username, 'create', 'user', uname, { name, role });
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save user' }); }
@@ -458,7 +529,7 @@ app.put('/users/:username', requireAuth, requireAdmin, async (req, res) => {
     // Build dynamic update
     const sets = [], vals = []; let i = 1;
     if (name)            { sets.push(`name=$${i++}`); vals.push(name); }
-    if (role)            { sets.push(`role=$${i++}`); vals.push(['admin','office','sales'].includes(role)?role:'sales'); }
+    if (role)            { sets.push(`role=$${i++}`); vals.push(['admin','office','sales','sales_lead'].includes(role)?role:'sales'); }
     if (active !== undefined) { sets.push(`active=$${i++}`); vals.push(!!active); }
     if (password)        {
       if (String(password).length < 6) return res.status(400).json({ error:'Password must be at least 6 characters' });
@@ -481,6 +552,135 @@ app.delete('/users/:username', requireAuth, requireAdmin, async (req, res) => {
     await audit2(req.user.username, 'delete', 'user', target, null);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to deactivate user' }); }
+});
+
+// ── PURCHASE EVALUATION / COMPS (office + admin only) ─────────────────────────
+// Reads a historical purchases Google sheet and returns comparable past buys so
+// you can judge whether a prospective purchase is a good deal.
+function buildPurchaseHeaderMap(headerRow) {
+  const want = {
+    year:['year','yr'], make:['make'], model:['model'],
+    miles:['mile','mileage','odometer'], hours:['hour','hrs'], apu:['apu'],
+    price:['price','paid','cost','purchase','amount'], date:['date','purchased','bought'],
+  };
+  const headers = (headerRow||[]).map(h => String(h||'').trim().toLowerCase());
+  const map = {};
+  for (const [field, keys] of Object.entries(want)) {
+    for (let i=0;i<headers.length;i++){ if(map[field]!=null)break; if(Object.values(map).includes(i))continue; if(keys.some(k=>headers[i]===k)){map[field]=i;break;} }
+    if (map[field]==null) for (let i=0;i<headers.length;i++){ if(Object.values(map).includes(i))continue; if(keys.some(k=>headers[i].includes(k))){map[field]=i;break;} }
+  }
+  return map;
+}
+
+app.post('/evaluate-purchase', requireAuth, async (req, res) => {
+  try {
+    if (!(req.user.role === 'office' || req.user.role === 'admin'))
+      return res.status(403).json({ error:'Not allowed' });
+
+    const q = sanitizeObj(req.body);
+    const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?null:n; };
+
+    // Comps come from the SAME inventory sheet — every row with a Purchase P.
+    const sheetId = PURCHASE_HISTORY_SHEET_ID || INV_SHEET_ID;
+    const sheetTab = PURCHASE_HISTORY_SHEET_ID ? PURCHASE_HISTORY_TAB : INV_SHEET_TAB;
+    const sheets = getSheetsClient();
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId:sheetId, range:sheetTab });
+    const rows = resp.data.values || [];
+    if (rows.length <= 1) return res.json({ comps:[], stats:null, message:'No inventory history found.' });
+    const hmap = buildInvHeaderMap(rows[0]);
+    const cell = (r, f) => hmap[f]!=null ? (r[hmap[f]]||'') : '';
+
+    const qYear = num(q.year), qMiles = num(q.miles);
+    const makeL = (q.make||'').trim().toLowerCase();
+    const modelL = (q.model||'').trim().toLowerCase();
+    const apuL = (q.apu||'').trim().toLowerCase();
+
+    // Every row with a Purchase P counts as a past purchase.
+    const all = rows.slice(1).map(r => {
+      const recon = (num(cell(r,'transport'))||0) + (num(cell(r,'repairDot'))||0) + (num(cell(r,'cleaningWarr'))||0) + (num(cell(r,'docsFee'))||0);
+      return {
+        unit:cell(r,'unit'), year:cell(r,'year'), make:cell(r,'make'), model:cell(r,'model'),
+        miles:cell(r,'miles'), hours:cell(r,'hours'), apu:cell(r,'apu'),
+        purchaseP:num(cell(r,'purchaseP')),
+        reconditioning: recon || null,
+        sellPrice:num(cell(r,'sellPrice')), profit:num(cell(r,'profit')),
+      };
+    }).filter(x => x.purchaseP != null);
+
+    const comps = all.filter(x => {
+      const sameMake = makeL ? (x.make||'').toLowerCase().includes(makeL) || makeL.includes((x.make||'').toLowerCase()) : true;
+      const sameModel = modelL ? (x.model||'').toLowerCase().includes(modelL) || modelL.includes((x.model||'').toLowerCase()) : true;
+      return sameMake && sameModel;
+    }).map(x => {
+      let score = 0;
+      if (qYear && num(x.year)) score += Math.abs(qYear - num(x.year)) * 2;
+      if (qMiles && num(x.miles)) score += Math.abs(qMiles - num(x.miles)) / 50000;
+      if (apuL && (x.apu||'').toLowerCase() !== apuL) score += 1;
+      return { ...x, score };
+    }).sort((a,b) => a.score - b.score).slice(0, 15);
+
+    let stats = null;
+    if (comps.length) {
+      const prices = comps.map(c => c.purchaseP).sort((a,b)=>a-b);
+      const sum = prices.reduce((a,b)=>a+b,0);
+      const profits = comps.map(c=>c.profit).filter(p=>p!=null);
+      stats = {
+        count: prices.length,
+        min: prices[0], max: prices[prices.length-1],
+        avg: Math.round(sum / prices.length),
+        median: prices[Math.floor(prices.length/2)],
+        avgProfit: profits.length ? Math.round(profits.reduce((a,b)=>a+b,0)/profits.length) : null,
+      };
+    }
+    res.json({ comps, stats, message: comps.length ? null : 'No comparable past purchases found for that make/model.' });
+  } catch(e) { console.error('evaluate error', e); res.status(500).json({ error:'Evaluation failed' }); }
+});
+
+// ── UPCOMING UNITS (arriving inventory) ───────────────────────────────────────
+// View: any logged-in user. Manage: office + admin (reuses 'closing' tier-ish;
+// we gate writes to office/admin explicitly).
+function canManageUpcoming(role) { return role === 'office' || role === 'admin'; }
+
+app.get('/upcoming', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pgQuery('SELECT * FROM upcoming_units ORDER BY expected_date ASC NULLS LAST, created_at DESC');
+    res.json(rows.map(r => ({
+      id:r.id, year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'', hours:r.hours||'',
+      apu:r.apu||'', color:r.color||'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
+      expectedDate:r.expected_date||'', expectedPrice:r.expected_price||'', notes:r.notes||'',
+      createdBy:r.created_by||'',
+    })));
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load upcoming units' }); }
+});
+
+app.post('/upcoming', requireAuth, async (req, res) => {
+  try {
+    if (!canManageUpcoming(req.user.role)) return res.status(403).json({ error:'Not allowed' });
+    const d = sanitizeObj(req.body);
+    if (d.id) {
+      await pgQuery(`UPDATE upcoming_units SET year=$2,make=$3,model=$4,miles=$5,hours=$6,apu=$7,color=$8,
+        hp=$9,ratio=$10,vin=$11,expected_date=$12,expected_price=$13,notes=$14 WHERE id=$1`,
+        [d.id, d.year||'', d.make||'', d.model||'', d.miles||'', d.hours||'', d.apu||'', d.color||'',
+         d.hp||'', d.ratio||'', d.vin||'', d.expectedDate||'', d.expectedPrice||'', d.notes||'']);
+      await audit2(req.user.username, 'update', 'upcoming_unit', String(d.id), null);
+    } else {
+      const r = await pgQuery(`INSERT INTO upcoming_units (year,make,model,miles,hours,apu,color,hp,ratio,vin,
+        expected_date,expected_price,notes,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        [d.year||'', d.make||'', d.model||'', d.miles||'', d.hours||'', d.apu||'', d.color||'', d.hp||'',
+         d.ratio||'', d.vin||'', d.expectedDate||'', d.expectedPrice||'', d.notes||'', req.user.username]);
+      await audit2(req.user.username, 'create', 'upcoming_unit', String(r.rows[0].id), { make:d.make, model:d.model });
+    }
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save upcoming unit' }); }
+});
+
+app.delete('/upcoming/:id', requireAuth, async (req, res) => {
+  try {
+    if (!canManageUpcoming(req.user.role)) return res.status(403).json({ error:'Not allowed' });
+    await pgQuery('DELETE FROM upcoming_units WHERE id=$1', [req.params.id]);
+    await audit2(req.user.username, 'delete', 'upcoming_unit', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to delete' }); }
 });
 
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
@@ -750,26 +950,43 @@ app.get('/inventory', requireAuth, async (req, res) => {
     // Inventory is maintained by hand in the Google Sheet, so ALWAYS read the
     // sheet as the source of truth and sync it into Postgres. (Reading only from
     // Postgres would mean Sheet edits never show up.)
-    let inventory = null;
+    const role = (req.user && req.user.role) || 'sales';
+    let fullInventory = null;
     try {
       const sheets = getSheetsClient();
-      const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:'Sheet1' });
+      const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:INV_SHEET_TAB });
       const rows = response.data.values || [];
-      inventory = rows.length <= 1 ? [] : rows.slice(1).map(r => ({
-        unit:r[0]||'', year:r[1]||'', make:r[2]||'', model:r[3]||'',
-        hours:r[4]||'', miles:r[5]||'', apu:r[6]||'', color:r[7]||'',
-        ratio:r[8]||'', hp:r[9]||'', listPrice:r[10]||'', salePrice:r[11]||'',
-        status:r[12]||'', vin:r[13]||'',
-      }));
+      if (rows.length <= 1) { fullInventory = []; }
+      else {
+        const hmap = buildInvHeaderMap(rows[0]);
+        const cell = (r, field) => (hmap[field]!=null ? (r[hmap[field]]||'') : '');
+        const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; };
+        fullInventory = rows.slice(1)
+          .filter(r => r && (cell(r,'unit')||cell(r,'make')||cell(r,'model')))
+          .map(r => {
+            const recon = num(cell(r,'transport')) + num(cell(r,'repairDot')) + num(cell(r,'cleaningWarr')) + num(cell(r,'docsFee'));
+            return {
+              unit:cell(r,'unit'), year:cell(r,'year'), make:cell(r,'make'), model:cell(r,'model'),
+              hours:cell(r,'hours'), miles:cell(r,'miles'), trans:cell(r,'trans'), apu:cell(r,'apu'),
+              color:cell(r,'color'), ratio:cell(r,'ratio'), hp:cell(r,'hp'),
+              listPrice:cell(r,'listPrice'), salePrice:cell(r,'sellPrice'), status:cell(r,'status'), vin:cell(r,'vin'),
+              purchaseP:cell(r,'purchaseP'), reconditioning: recon ? String(recon) : '', profit:cell(r,'profit'),
+            };
+          });
+      }
     } catch(sheetErr) {
       console.warn('Inventory sheet read failed, falling back to Postgres:', sheetErr.message);
     }
-    if (inventory) {
-      DBW.mirrorInventory(inventory);   // keep PG copy current
-      return res.json(inventory);
+    if (fullInventory) {
+      DBW.mirrorInventory(fullInventory);   // keep PG copy current (full data)
+      // Filter columns to what this role may see BEFORE sending to the browser
+      return res.json(fullInventory.map(row => invRowForRole(row, role)));
     }
-    // Sheet unreachable — serve last-known from Postgres
-    if (await usePg()) return res.json(await DBR.readInventory());
+    // Sheet unreachable — serve last-known from Postgres (also role-filtered)
+    if (await usePg()) {
+      const pg = await DBR.readInventory();
+      return res.json(pg.map(row => invRowForRole(row, role)));
+    }
     res.json([]);
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load inventory' }); }
 });
