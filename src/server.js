@@ -707,6 +707,65 @@ app.get('/debug/inventory', requireAuth, requireAdmin, async (req, res) => {
   } catch(e) { res.json({ error: e.message, hint: 'If this errors, the service account likely cannot read the sheet — share it with the service account email.' }); }
 });
 
+// ── CLIENT INVENTORY LIST PDF (any authenticated user) ────────────────────────
+app.post('/inventory/client-pdf', requireAuth, async (req, res) => {
+  try {
+    const units = Array.isArray(req.body.units) ? req.body.units : [];
+    if (!units.length) return res.status(400).json({ error:'No units provided' });
+
+    const pdfDoc = await PDFDocument.create();
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const logo = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
+    const M = 40;
+    const cols = [M, M+38, M+70, M+116, M+200, M+256, M+306, M+352, M+392, M+450, M+492];
+    const colHeaders = ['Unit','Year','Make','Model','Miles','Hours','HP','Ratio','Color','APU','List price'];
+
+    let page, width, height, y;
+    const dt = (t,x,yy,o={}) => { try { page.drawText(String(t==null?'':t),{x,y:yy,size:o.size||9,font:o.bold?fontBold:font,color:o.color||rgb(0,0,0)}); } catch(e){} };
+    function tableHeaderRow() {
+      for (let i=0;i<colHeaders.length;i++) dt(colHeaders[i], cols[i], y, { size:8.5, bold:true });
+      y -= 5;
+      page.drawLine({ start:{x:M,y}, end:{x:width-M,y}, thickness:0.6, color:rgb(0.3,0.3,0.3) });
+      y -= 13;
+    }
+    function newPage(first) {
+      page = pdfDoc.addPage([612, 792]);
+      const s = page.getSize(); width = s.width; height = s.height; y = height - 44;
+      // branded header
+      try { const d = logo.scaleToFit(120,42); page.drawImage(logo, { x:M, y:y-d.height+8, width:d.width, height:d.height }); } catch(e){}
+      const ax = width - M - 175;
+      dt('Direct Truck Sales Inc.', ax, y, {bold:true});
+      dt('15w740 N. Frontage Rd, Ste 2', ax, y-11, {size:8});
+      dt('Burr Ridge, IL 60527', ax, y-21, {size:8});
+      dt('630-701-1000', ax, y-31, {size:8});
+      page.drawText('Sales@Direct-Truck.com', { x:ax, y:y-41, size:8, font, color:rgb(0,0.3,0.7) });
+      y -= 60;
+      page.drawRectangle({ x:M, y:y-16, width:width-M*2, height:22, color:rgb(0.12,0.12,0.12) });
+      page.drawText('AVAILABLE UNITS', { x:width/2-48, y:y-9, size:12, font:fontBold, color:rgb(1,1,1) });
+      y -= 34;
+      tableHeaderRow();
+    }
+
+    newPage(true);
+    for (const u of units) {
+      if (y < 70) newPage(false);
+      const vals = [u.unit,u.year,u.make,u.model,u.miles,u.hours,u.hp,u.ratio,u.color,u.apu,u.listPrice];
+      for (let i=0;i<vals.length;i++) dt(vals[i], cols[i], y, { size:8.5 });
+      y -= 4;
+      page.drawLine({ start:{x:M,y}, end:{x:width-M,y}, thickness:0.4, color:rgb(0.85,0.85,0.85) });
+      y -= 13;
+    }
+    y -= 8;
+    dt('Prices and availability subject to change. Contact us for current details.', M, y, { size:7.5, color:rgb(0.5,0.5,0.5) });
+
+    const bytes = await pdfDoc.save();
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition','attachment; filename="DirectTruckSales-Units.pdf"');
+    res.send(Buffer.from(bytes));
+  } catch(e) { console.error('client pdf error', e); res.status(500).json({ error:'PDF generation failed' }); }
+});
+
 // ── INVENTORY STATUS UPDATE — writes the Status cell back to the sheet ─────────
 // Any authenticated user (incl. sales) may set a unit's status.
 app.post('/inventory/status', requireAuth, async (req, res) => {
