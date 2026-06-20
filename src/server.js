@@ -683,6 +683,66 @@ app.delete('/upcoming/:id', requireAuth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to delete' }); }
 });
 
+// ── INVENTORY DIAGNOSTIC (admin) — confirms which sheet + columns are connected ─
+app.get('/debug/inventory', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:INV_SHEET_TAB });
+    const rows = response.data.values || [];
+    const header = rows[0] || [];
+    const hmap = buildInvHeaderMap(header);
+    const mapped = {};
+    for (const [field, idx] of Object.entries(hmap)) mapped[field] = { col: idx, header: header[idx] };
+    res.json({
+      sheetIdTail: '...' + String(INV_SHEET_ID).slice(-6),
+      tab: INV_SHEET_TAB,
+      usingRealSheet: !!process.env.INV_SHEET_ID,
+      totalRows: rows.length,
+      header,
+      mappedColumns: mapped,
+      costMapped: hmap.purchaseP != null,
+      profitMapped: hmap.profit != null,
+      firstRowSample: rows[1] || null,
+    });
+  } catch(e) { res.json({ error: e.message, hint: 'If this errors, the service account likely cannot read the sheet — share it with the service account email.' }); }
+});
+
+// ── INVENTORY STATUS UPDATE — writes the Status cell back to the sheet ─────────
+// Any authenticated user (incl. sales) may set a unit's status.
+app.post('/inventory/status', requireAuth, async (req, res) => {
+  try {
+    const { unit, status } = sanitizeObj(req.body);
+    if (!unit || !status) return res.status(400).json({ error:'unit and status required' });
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:INV_SHEET_TAB });
+    const rows = response.data.values || [];
+    if (rows.length <= 1) return res.status(404).json({ error:'Inventory sheet empty' });
+    const hmap = buildInvHeaderMap(rows[0]);
+    if (hmap.unit == null || hmap.status == null)
+      return res.status(400).json({ error:'Could not locate Unit or Status column in the sheet' });
+    // Find the row whose unit cell matches
+    let rowNum = -1;
+    for (let i=1;i<rows.length;i++) {
+      if (String((rows[i][hmap.unit]||'')).trim() === String(unit).trim()) { rowNum = i+1; break; }
+    }
+    if (rowNum < 0) return res.status(404).json({ error:'Unit not found in sheet' });
+    // Convert status column index to an A1 column letter
+    const colLetter = (n) => { let s=''; n=n+1; while(n>0){ const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; };
+    const cell = `${INV_SHEET_TAB}!${colLetter(hmap.status)}${rowNum}`;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId:INV_SHEET_ID, range:cell, valueInputOption:'RAW',
+      requestBody:{ values:[[status]] }
+    });
+    // Mirror to Postgres copy
+    try { await pgQuery('UPDATE inventory SET status=$2 WHERE unit=$1', [String(unit), status]); } catch(e) {}
+    await audit2(req.user.username, 'update', 'inventory_status', String(unit), { status });
+    res.json({ success:true });
+  } catch(e) {
+    console.error('status update error', e);
+    res.status(500).json({ error: 'Failed to update status. The service account may need EDIT access to the sheet.' });
+  }
+});
+
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
 app.get('/search', requireAuth, async (req, res) => {
   try {
