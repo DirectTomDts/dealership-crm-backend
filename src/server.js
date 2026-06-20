@@ -1080,8 +1080,14 @@ app.get('/inventory', requireAuth, async (req, res) => {
         const hmap = buildInvHeaderMap(rows[0]);
         const cell = (r, field) => (hmap[field]!=null ? (r[hmap[field]]||'') : '');
         const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; };
+        // Skip blank rows and obvious placeholder/template rows (e.g. "Column1").
+        const isPlaceholder = (r) => {
+          const u = String(cell(r,'unit')||'').trim();
+          const mk = String(cell(r,'make')||'').trim();
+          return /^column\s*\d+$/i.test(u) || /^column\s*\d+$/i.test(mk);
+        };
         fullInventory = rows.slice(1)
-          .filter(r => r && (cell(r,'unit')||cell(r,'make')||cell(r,'model')))
+          .filter(r => r && (cell(r,'unit')||cell(r,'make')||cell(r,'model')) && !isPlaceholder(r))
           .map(r => {
             const recon = num(cell(r,'transport')) + num(cell(r,'repairDot')) + num(cell(r,'cleaningWarr')) + num(cell(r,'docsFee'));
             return {
