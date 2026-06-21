@@ -45,7 +45,7 @@ async function buildDealsByLead() {
     FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id = b.id
     WHERE b.lead_id IS NOT NULL AND b.deleted_at IS NULL
     GROUP BY b.id ORDER BY b.created_at DESC`);
-  for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'' });
+  for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', id:r.id, d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'' });
 
   const td = await query(`SELECT * FROM test_drives WHERE lead_id IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC`);
   for (const r of td.rows) push(r.lead_id, { t:'Test Drive', d:r.drive_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });

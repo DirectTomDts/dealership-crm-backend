@@ -718,13 +718,23 @@ app.post('/inventory/client-pdf', requireAuth, async (req, res) => {
     const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
     const logo = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
     const M = 40;
-    const cols = [M, M+38, M+70, M+116, M+200, M+256, M+306, M+352, M+392, M+450, M+492];
+    const cols = [M, M+30, M+62, M+126, M+200, M+248, M+292, M+344, M+378, M+422, M+490];
+    // right edge of each column's text area (next col start - small pad); last = page edge
+    const colEnd = (i) => (i < cols.length-1 ? cols[i+1] - 4 : 612 - M);
     const colHeaders = ['Unit','Year','Make','Model','Miles','Hours','HP','Ratio','Color','APU','List price'];
 
     let page, width, height, y;
     const dt = (t,x,yy,o={}) => { try { page.drawText(String(t==null?'':t),{x,y:yy,size:o.size||9,font:o.bold?fontBold:font,color:o.color||rgb(0,0,0)}); } catch(e){} };
+    // Trim text with an ellipsis so it never exceeds maxW points at the given size
+    const fit = (t, maxW, size, useBold) => {
+      let s = String(t==null?'':t);
+      const f = useBold ? fontBold : font;
+      if (f.widthOfTextAtSize(s, size) <= maxW) return s;
+      while (s.length > 1 && f.widthOfTextAtSize(s + '…', size) > maxW) s = s.slice(0, -1);
+      return s + '…';
+    };
     function tableHeaderRow() {
-      for (let i=0;i<colHeaders.length;i++) dt(colHeaders[i], cols[i], y, { size:8.5, bold:true });
+      for (let i=0;i<colHeaders.length;i++) dt(fit(colHeaders[i], colEnd(i)-cols[i], 8.5, true), cols[i], y, { size:8.5, bold:true });
       y -= 5;
       page.drawLine({ start:{x:M,y}, end:{x:width-M,y}, thickness:0.6, color:rgb(0.3,0.3,0.3) });
       y -= 13;
@@ -751,7 +761,7 @@ app.post('/inventory/client-pdf', requireAuth, async (req, res) => {
     for (const u of units) {
       if (y < 70) newPage(false);
       const vals = [u.unit,u.year,u.make,u.model,u.miles,u.hours,u.hp,u.ratio,u.color,u.apu,u.listPrice];
-      for (let i=0;i<vals.length;i++) dt(vals[i], cols[i], y, { size:8.5 });
+      for (let i=0;i<vals.length;i++) dt(fit(vals[i], colEnd(i)-cols[i], 8.5, false), cols[i], y, { size:8.5 });
       y -= 4;
       page.drawLine({ start:{x:M,y}, end:{x:width-M,y}, thickness:0.4, color:rgb(0.85,0.85,0.85) });
       y -= 13;
@@ -944,19 +954,30 @@ app.get('/history/:entity/:id', requireAuth, async (req, res) => {
 app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
   try {
     const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
     const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; };
+
+    // Optional date range: ?from=YYYY-MM&to=YYYY-MM (inclusive of whole months).
+    // Defaults to the current month if not provided.
+    const ym = (s) => /^\d{4}-\d{2}$/.test(String(s||'')) ? String(s) : null;
+    const curYM = now.toISOString().slice(0,7);
+    const fromYM = ym(req.query.from) || ym(req.query.to) || curYM;
+    const toYM   = ym(req.query.to)   || ym(req.query.from) || curYM;
+    // normalize so from <= to
+    const lo = fromYM <= toYM ? fromYM : toYM;
+    const hi = fromYM <= toYM ? toYM : fromYM;
+    const rangeStart = lo + '-01';
+    // end = last day of hi month → compare with < firstDayOfNextMonth
+    const hiParts = hi.split('-').map(Number);
+    const nextMonth = new Date(hiParts[0], hiParts[1], 1).toISOString().split('T')[0]; // first day after hi
 
     // Pull the raw data we need
     const bos = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at FROM bills_of_sale')).rows;
     const leads = (await pgQuery('SELECT id, status, salesperson, source, created_at FROM leads')).rows;
     const inv = (await pgQuery('SELECT unit, status, date_added FROM inventory')).rows;
 
-    // Units sold this month + gross revenue (by bos_date when present, else created_at)
-    const inMonth = (r) => {
-      const d = (r.bos_date && r.bos_date.length>=7) ? r.bos_date : (r.created_at ? new Date(r.created_at).toISOString().split('T')[0] : '');
-      return d >= monthStart;
-    };
+    // A BOS falls in range if its effective date is within [rangeStart, nextMonth)
+    const effDate = (r) => (r.bos_date && r.bos_date.length>=7) ? r.bos_date : (r.created_at ? new Date(r.created_at).toISOString().split('T')[0] : '');
+    const inMonth = (r) => { const d = effDate(r); return d >= rangeStart && d < nextMonth; };
     const monthBos = bos.filter(inMonth);
     const unitsSoldMonth = monthBos.length;
     const grossMonth = monthBos.reduce((s,r)=>s+num(r.total),0);
@@ -1020,7 +1041,8 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     const availableCount = available.length;
 
     res.json({
-      month: monthStart.slice(0,7),
+      month: (lo === hi) ? lo : (lo + ' to ' + hi),
+      rangeFrom: lo, rangeTo: hi,
       unitsSoldMonth, grossMonth, grossAll,
       salesByPerson: Object.values(byPerson).sort((a,b)=>b.revenue-a.revenue),
       avgDaysToSale,
@@ -1484,6 +1506,15 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
       'X-Drive-Link': bosUp ? bosUp.link : '', 'Access-Control-Expose-Headers':'X-Drive-Link'});
     res.send(bosBuf);
   } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
+});
+
+app.get('/billsofsale/:id', requireAuth, async (req, res) => {
+  try {
+    const all = await DBR.readBillsOfSale();
+    const bos = all.find(b => b.id === req.params.id);
+    if (!bos) return res.status(404).json({ error:'Bill of sale not found' });
+    res.json(bos);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load bill of sale' }); }
 });
 
 app.post('/billsofsale/save', requireAuth, async (req, res) => {
