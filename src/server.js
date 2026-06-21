@@ -10,7 +10,8 @@ const DBR = require('./dbread');   // Phase 4 read layer
 const { isAvailable: pgAvailable } = require('./db');
 const { query: pgQuery } = require('./db');
 const bcrypt = require('bcryptjs'); // Phase 5: hashed passwords
-const DRIVE = require('./drive'); // Tier 3: archive PDFs to Shared Drive
+const DRIVE = require('./drive');
+const MAIL = require('./mailer'); // Tier 3: archive PDFs to Shared Drive
 // READ_FROM controls where GET routes read. 'postgres' = read from DB, anything
 // else (or unset) = read from Google Sheets. Flip in Railway vars; no code change.
 const READ_FROM = (process.env.READ_FROM || 'sheets').toLowerCase();
@@ -634,6 +635,53 @@ app.post('/evaluate-purchase', requireAuth, async (req, res) => {
     }
     res.json({ comps, stats, message: comps.length ? null : 'No comparable past purchases found for that make/model.' });
   } catch(e) { console.error('evaluate error', e); res.status(500).json({ error:'Evaluation failed' }); }
+});
+
+// ── IN-APP NOTIFICATIONS ──────────────────────────────────────────────────────
+// List notifications visible to this user's role, with read/unread state.
+app.get('/notifications', requireAuth, async (req, res) => {
+  try {
+    const role = (req.user && req.user.role) || '';
+    const uname = req.user.username;
+    const { rows } = await pgQuery(`
+      SELECT n.*, (r.username IS NOT NULL) AS is_read
+      FROM notifications n
+      LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.username = $1
+      ORDER BY n.created_at DESC LIMIT 100`, [uname]);
+    const visible = rows.filter(n => {
+      const roles = String(n.for_roles||'').split(',').map(s=>s.trim()).filter(Boolean);
+      return roles.length === 0 || roles.includes(role);
+    }).map(n => ({
+      id: n.id, kind: n.kind, title: n.title, body: n.body,
+      linkType: n.link_type||'', linkId: n.link_id||'',
+      createdAt: n.created_at, read: !!n.is_read,
+    }));
+    res.json({ notifications: visible, unread: visible.filter(n => !n.read).length });
+  } catch(e) { console.error('notifications error', e); res.status(500).json({ error:'Failed to load notifications' }); }
+});
+
+// Mark one (or all) notifications read for the current user.
+app.post('/notifications/read', requireAuth, async (req, res) => {
+  try {
+    const uname = req.user.username;
+    const id = req.body && req.body.id;
+    if (id === 'all' || id == null) {
+      // mark all currently-visible as read
+      const role = (req.user && req.user.role) || '';
+      const { rows } = await pgQuery('SELECT id, for_roles FROM notifications');
+      for (const n of rows) {
+        const roles = String(n.for_roles||'').split(',').map(s=>s.trim()).filter(Boolean);
+        if (roles.length === 0 || roles.includes(role)) {
+          await pgQuery(`INSERT INTO notification_reads (notification_id, username) VALUES ($1,$2)
+            ON CONFLICT (notification_id, username) DO NOTHING`, [n.id, uname]);
+        }
+      }
+    } else {
+      await pgQuery(`INSERT INTO notification_reads (notification_id, username) VALUES ($1,$2)
+        ON CONFLICT (notification_id, username) DO NOTHING`, [id, uname]);
+    }
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to mark read' }); }
 });
 
 // ── UPCOMING UNITS (arriving inventory) ───────────────────────────────────────
@@ -1550,6 +1598,22 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
         d.units?JSON.stringify(d.units):'']);
     await DBW.mirrorBillOfSale(id, d, req.user && req.user.username);
     res.json({success:true,id});
+    // Notify finance + owners when a deposit was taken (non-blocking, never throws)
+    try {
+      const dep = parseFloat(String(d.depositAmount||'').replace(/[^0-9.]/g,''));
+      if (!isNaN(dep) && dep > 0) {
+        const savedBy = req.user && req.user.username;
+        // 1) In-app notification for office + admin (you, Olia, finance roles)
+        const c = MAIL.depositContent(d, savedBy);
+        DBW.createNotification({
+          kind:'deposit', title:'Deposit received', body:c.summary,
+          linkType: d.leadId ? 'lead' : '', linkId: d.leadId || '',
+          forRoles:'office,admin',
+        }).catch(e => console.warn('[deposit-notify in-app]', e.message));
+        // 2) Email via Google Workspace SMTP (non-blocking)
+        MAIL.notifyDeposit(d, savedBy).catch(e => console.warn('[deposit-notify email]', e.message));
+      }
+    } catch(e) { console.warn('[deposit-notify]', e.message); }
   } catch(e){console.error(e);res.status(500).json({error:'Failed to save bill of sale'});}
 });
 

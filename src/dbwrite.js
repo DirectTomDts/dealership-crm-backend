@@ -227,7 +227,16 @@ const mirrorInventory = safe('inventory sync', async (items) => {
   }
 });
 
+// Create an in-app notification visible to the given roles.
+const createNotification = safe('notification', async ({ kind, title, body, linkType, linkId, forRoles }) => {
+  await query(
+    `INSERT INTO notifications (kind, title, body, link_type, link_id, for_roles)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [kind||'info', title||'', body||'', linkType||'', linkId||'', forRoles||'office,admin']);
+});
+
 module.exports = {
+  createNotification,
   mirrorLeadInsert, mirrorLeadUpdate, mirrorLeadEnrich,
   mirrorTestDrive, mirrorBillOfSale, mirrorClosing, mirrorInventory,
 };
