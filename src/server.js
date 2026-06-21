@@ -824,6 +824,77 @@ app.post('/inventory/client-pdf', requireAuth, async (req, res) => {
   } catch(e) { console.error('client pdf error', e); res.status(500).json({ error:'PDF generation failed' }); }
 });
 
+// ── ADD INVENTORY UNIT (office + admin) — appends a row to the inventory sheet ─
+app.post('/inventory/add', requireAuth, async (req, res) => {
+  try {
+    if (!(req.user.role === 'office' || req.user.role === 'admin'))
+      return res.status(403).json({ error:'Only office or admin can add inventory' });
+
+    const d = sanitizeObj(req.body);
+    if (!d.unit && !d.make && !d.model)
+      return res.status(400).json({ error:'At least a unit number, make, or model is required' });
+
+    const sheets = getSheetsClient();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId:INV_SHEET_ID, range:INV_SHEET_TAB });
+    const rows = response.data.values || [];
+    if (!rows.length) return res.status(400).json({ error:'Inventory sheet has no header row to map columns' });
+    const header = rows[0];
+    const hmap = buildInvHeaderMap(header);
+
+    // Guard against duplicate unit numbers
+    if (d.unit && hmap.unit != null) {
+      const exists = rows.slice(1).some(r => String((r[hmap.unit]||'')).trim().toLowerCase() === String(d.unit).trim().toLowerCase());
+      if (exists) return res.status(409).json({ error:`Unit "${d.unit}" already exists in the sheet` });
+    }
+
+    // Map the incoming fields to canonical header keys, then place each value in
+    // the exact column the sheet uses (works regardless of column order).
+    const fieldValues = {
+      unit:d.unit, year:d.year, make:d.make, model:d.model, hours:d.hours, miles:d.miles,
+      trans:d.trans, apu:d.apu, vin:d.vin, color:d.color, ratio:d.ratio, hp:d.hp,
+      purchaseP:d.purchaseP, transport:d.transport, repairDot:d.repairDot,
+      cleaningWarr:d.cleaningWarr, docsFee:d.docsFee, sellPrice:d.sellPrice,
+      profit:d.profit, listPrice:d.listPrice, status:d.status || 'Available',
+    };
+    // Build a row sized to the header, placing each mapped field at its column index
+    const rowValues = new Array(header.length).fill('');
+    for (const [field, idx] of Object.entries(hmap)) {
+      if (idx != null && idx < rowValues.length && fieldValues[field] != null && fieldValues[field] !== '') {
+        rowValues[idx] = String(fieldValues[field]);
+      }
+    }
+
+    // Append at the next empty row of the INVENTORY sheet (A column anchored)
+    const nextRow = rows.length + 1;
+    const lastColLetter = (n) => { let s=''; n=n+1; while(n>0){ const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; };
+    const endCol = lastColLetter(Math.max(header.length, rowValues.length) - 1);
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: INV_SHEET_ID,
+      range: `${INV_SHEET_TAB}!A${nextRow}:${endCol}${nextRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [rowValues] },
+    });
+
+    // Mirror to Postgres copy so the fallback + dashboard stay current
+    const num = (v) => { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; };
+    const recon = num(d.transport) + num(d.repairDot) + num(d.cleaningWarr) + num(d.docsFee);
+    try {
+      await DBW.mirrorInventory([{
+        unit:d.unit||'', year:d.year||'', make:d.make||'', model:d.model||'', hours:d.hours||'',
+        miles:d.miles||'', trans:d.trans||'', apu:d.apu||'', color:d.color||'', ratio:d.ratio||'',
+        hp:d.hp||'', listPrice:d.listPrice||'', salePrice:d.sellPrice||'', status:d.status||'Available',
+        vin:d.vin||'', cost:d.purchaseP||'', profit:d.profit||'',
+      }]);
+    } catch(e) { /* sheet is source of truth; mirror is best-effort */ }
+
+    await audit2(req.user.username, 'create', 'inventory_unit', String(d.unit||d.vin||''), { make:d.make, model:d.model });
+    res.json({ success:true });
+  } catch(e) {
+    console.error('inventory add error', e);
+    res.status(500).json({ error:'Failed to add unit. The service account may need EDIT access to the sheet.' });
+  }
+});
+
 // ── INVENTORY STATUS UPDATE — writes the Status cell back to the sheet ─────────
 // Any authenticated user (incl. sales) may set a unit's status.
 app.post('/inventory/status', requireAuth, async (req, res) => {
