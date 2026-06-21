@@ -125,6 +125,7 @@ const FEATURE_ACCESS = {
   trash: ['admin'],
   inventory_profit: ['sales_lead','office','admin'],  // Don + up can reveal profit
   inventory_cost:   ['office','admin'],               // only office/admin see cost
+  financing:        ['office','admin'],               // financing module: office + admin
   // leads, testdrive, billsofsale, inventory: open to all logged-in roles
 };
 function roleCan(role, feature) {
@@ -142,6 +143,7 @@ function permissionsFor(role) {
     dashboard: roleCan(role, 'dashboard'),
     inventoryProfit: roleCan(role, 'inventory_profit'),
     inventoryCost: roleCan(role, 'inventory_cost'),
+    financing: roleCan(role, 'financing'),
   };
 }
 function requireFeature(feature) {
@@ -929,6 +931,115 @@ app.post('/inventory/status', requireAuth, async (req, res) => {
     console.error('status update error', e);
     res.status(500).json({ error: 'Failed to update status. The service account may need EDIT access to the sheet.' });
   }
+});
+
+// ── FINANCING APPLICATIONS (office + admin) ───────────────────────────────────
+const FIN_FIELDS = ['lead_id','app_type','status','first_name','last_name','email','phone','dob',
+  'ssn_last4','home_address','home_city','home_state','home_zip','years_address','housing_status',
+  'monthly_housing','employer','job_title','years_employed','annual_income','drivers_license','dl_state',
+  'business_name','ein','business_type','years_in_business','business_address','business_city',
+  'business_state','business_zip','business_phone','dot_number','mc_number','num_trucks','annual_revenue',
+  'unit','vehicle_desc','purchase_price','down_payment','amount_financed','term_months',
+  'consent_signed','consent_date','credit_score','paynet_score','credit_notes',
+  'lender_id','lender_name','notes'];
+// camelCase (frontend) <-> snake_case (db)
+const toSnake = (s) => s.replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_,c) => c.toUpperCase());
+
+app.get('/financing', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`SELECT * FROM financing_applications WHERE deleted_at IS NULL ORDER BY updated_at DESC`);
+    res.json(rows.map(r => {
+      const o = {};
+      for (const k of Object.keys(r)) o[toCamel(k)] = r[k];
+      return o;
+    }));
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load financing applications' }); }
+});
+
+app.get('/financing/:id', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`SELECT * FROM financing_applications WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error:'Not found' });
+    const r = rows[0], o = {};
+    for (const k of Object.keys(r)) o[toCamel(k)] = r[k];
+    res.json(o);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load application' }); }
+});
+
+app.post('/financing', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    // Never store more than last 4 of SSN, even if more is sent
+    if (d.ssnLast4) d.ssnLast4 = String(d.ssnLast4).replace(/\D/g,'').slice(-4);
+    const id = d.id || 'FIN' + Date.now();
+    const cols = ['id'], vals = [id], ph = ['$1']; let i = 2;
+    for (const snake of FIN_FIELDS) {
+      const camel = toCamel(snake);
+      let v = d[camel];
+      if (snake === 'consent_signed') v = (v === true || v === 'true') ? true : false;
+      if (v === undefined) v = (snake === 'consent_signed') ? false : '';
+      cols.push(snake); vals.push(v); ph.push('$'+i); i++;
+    }
+    const existing = await pgQuery('SELECT id FROM financing_applications WHERE id=$1', [id]);
+    if (existing.rows.length) {
+      // update
+      const sets = FIN_FIELDS.map((s, idx) => `${s}=$${idx+2}`).join(', ');
+      await pgQuery(`UPDATE financing_applications SET ${sets}, updated_at=now() WHERE id=$1`,
+        [id, ...FIN_FIELDS.map(s => { const c=toCamel(s); let v=d[c]; if(s==='consent_signed') v=(v===true||v==='true'); if(v===undefined) v=(s==='consent_signed'?false:''); return v; })]);
+      await audit2(req.user.username, 'update', 'financing', id, null);
+    } else {
+      await pgQuery(`INSERT INTO financing_applications (${cols.join(',')}, created_by) VALUES (${ph.join(',')}, $${i})`,
+        [...vals, req.user.username]);
+      await audit2(req.user.username, 'create', 'financing', id, { type:d.appType });
+    }
+    res.json({ success:true, id });
+  } catch(e) { console.error('financing save error', e); res.status(500).json({ error:'Failed to save application' }); }
+});
+
+app.post('/financing/:id/submit', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const { lenderId, lenderName } = sanitizeObj(req.body);
+    await pgQuery(`UPDATE financing_applications SET lender_id=$2, lender_name=$3,
+      status='Submitted to Lender', submitted_at=now(), updated_at=now() WHERE id=$1`,
+      [req.params.id, lenderId||'', lenderName||'']);
+    await audit2(req.user.username, 'submit', 'financing', req.params.id, { lender: lenderName });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to submit' }); }
+});
+
+app.post('/financing/:id/delete', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    await pgQuery(`UPDATE financing_applications SET deleted_at=now(), deleted_by=$2 WHERE id=$1`,
+      [req.params.id, req.user.username]);
+    await audit2(req.user.username, 'delete', 'financing', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to delete' }); }
+});
+
+// ── LENDERS ───────────────────────────────────────────────────────────────────
+app.get('/lenders', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const { rows } = await pgQuery('SELECT * FROM lenders WHERE active=TRUE ORDER BY name');
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load lenders' }); }
+});
+app.post('/lenders', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    if (d.id) {
+      await pgQuery(`UPDATE lenders SET name=$2,contact=$3,email=$4,phone=$5,notes=$6,specialties=$7 WHERE id=$1`,
+        [d.id, d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'']);
+    } else {
+      await pgQuery(`INSERT INTO lenders (name,contact,email,phone,notes,specialties) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'']);
+    }
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save lender' }); }
+});
+app.delete('/lenders/:id', requireAuth, requireFeature('financing'), async (req, res) => {
+  try { await pgQuery('UPDATE lenders SET active=FALSE WHERE id=$1', [req.params.id]); res.json({ success:true }); }
+  catch(e) { res.status(500).json({ error:'Failed to remove lender' }); }
 });
 
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
