@@ -1425,8 +1425,10 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
       "Vehicle shall be returned within 3 hours or on dealer's demand, free of liens, in the same condition as received, or undersigned shall pay for all repairs necessary.",
       'Undersigned shall pay dealer immediately the full present retail value of the vehicle if it is not returned for any reason whatsoever.',
       'Vehicle is to be driven exclusively by the undersigned for test drive purposes only and shall not be used for transportation of persons or property for hire.',
-      "Vehicle shall not be operated in violation of any law, nor driven beyond a radius of 25 miles from dealer's place of business.",
+      "Vehicle shall not be operated in violation of any law, nor driven beyond a radius of 20 miles from dealer's place of business.",
       'Vehicle will be preserved and protected from all loss, damage, or injury. Unit is GPS monitored and shall not be modified or altered in any way.',
+      'The undersigned self-certifies that he/she is fully qualified and competent to operate this class of equipment and holds a valid Commercial Driver\u2019s License (CDL) appropriate for this vehicle.',
+      'The undersigned accepts full and sole responsibility for the unit during the test drive, including any and all damage, loss, theft, mechanical failure, traffic citations or tickets, and any accident or injury claims of any kind, and agrees to indemnify and hold the dealer harmless from all such liabilities.',
     ];
     conditions.forEach(c => {
       page.drawText('\u2022  '+c, {x:M+8,y,size:8.2,font,color:rgb(0,0,0),maxWidth:width-M*2-16,lineHeight:12});
@@ -1434,6 +1436,11 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
     });
 
     y-=4; ln(y); y-=12;
+    // Deposit-collected acknowledgment (checkbox + $1,000)
+    page.drawRectangle({ x:M, y:y-9, width:12, height:12, borderColor:rgb(0,0,0), borderWidth:1, color:(d.depositCollected ? rgb(0.12,0.12,0.12) : rgb(1,1,1)) });
+    if (d.depositCollected) { try { page.drawText('X', { x:M+2.5, y:y-7.5, size:10, font:fontBold, color:rgb(1,1,1) }); } catch(e){} }
+    dt('A refundable test-drive deposit of $1,000.00 has been collected and will be returned upon the unit being returned in its original condition.', M+20, y, {bold:true, size:8.5, maxWidth:width-M*2-20});
+    y-=22; ln(y); y-=12;
     dt('DYNO Testing NOT allowed',M,y,{bold:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
     y-=13;
     dt('Calibration, programming, and Parked Forced Regeneration NOT allowed',M,y,{italic:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
@@ -1689,7 +1696,6 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
     dt(p2,'WARRANTY DISCLAIMER (SEC. 1), LIMITATION OF LIABILITY (SEC. 4), RELEASE (SEC. 10), AND ODOMETER /',M,y2,{bold:true,size:7.5});
     y2 -= 10;
     dt(p2,'HOUR-METER CERTIFICATION AND EXEMPTION (SEC. 12).',M,y2,{bold:true,size:7.5});
-    dt(p2,'Purchaser initials: ___________',W-M-130,y2,{size:8});
     y2 -= 22; ln(p2,y2+8);
     dt(p2,'Purchaser Signature:',M,y2-7,{bold:true,size:9});dt(p2,'_________________________________',M+120,y2-7,{size:9});
     dt(p2,'Date:',M+372,y2-7,{bold:true,size:9});dt(p2,'__________',M+398,y2-7,{size:9});
