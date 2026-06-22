@@ -1436,11 +1436,13 @@ app.post('/testdrive/generate', requireAuth, async (req, res) => {
     });
 
     y-=4; ln(y); y-=12;
-    // Deposit-collected acknowledgment (checkbox + $1,000)
+    // Deposit-collected acknowledgment (checkbox + $1,000) — two lines, properly spaced
     page.drawRectangle({ x:M, y:y-9, width:12, height:12, borderColor:rgb(0,0,0), borderWidth:1, color:(d.depositCollected ? rgb(0.12,0.12,0.12) : rgb(1,1,1)) });
     if (d.depositCollected) { try { page.drawText('X', { x:M+2.5, y:y-7.5, size:10, font:fontBold, color:rgb(1,1,1) }); } catch(e){} }
-    dt('A refundable test-drive deposit of $1,000.00 has been collected and will be returned upon the unit being returned in its original condition.', M+20, y, {bold:true, size:8.5, maxWidth:width-M*2-20});
-    y-=22; ln(y); y-=12;
+    page.drawText('A refundable test-drive deposit of $1,000.00 has been collected and will be returned',
+      { x:M+20, y, size:8.5, font:fontBold, color:rgb(0,0,0), maxWidth:width-M*2-20 });
+    dt('upon the unit being returned in its original condition.', M+20, y-11, {bold:true, size:8.5});
+    y-=24; ln(y); y-=12;
     dt('DYNO Testing NOT allowed',M,y,{bold:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
     y-=13;
     dt('Calibration, programming, and Parked Forced Regeneration NOT allowed',M,y,{italic:true,size:9}); dt('Initials: ____________',width-M-130,y,{size:9});
