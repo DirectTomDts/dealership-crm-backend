@@ -176,6 +176,26 @@ const mirrorBillOfSale = safe('bill of sale', async (id, d, username) => {
          u.serviceContractLevel||'', u.serviceContractCoverage||'', u.serviceContractPrice||'',
          u.salePrice||'', u.salesTax||'', u.titleFee||'', u.docFee||'',
          u.item1||'', u.item2||'', u.item3||'', u.item4||'']);
+
+      // Sync repair/to-fix items for this unit into repair_items (idempotent).
+      // Preserves the done/pending state of items that already exist.
+      const vehDesc = `${u.year||''} ${u.make||''} ${u.model||''}`.trim();
+      const slots = [u.item1, u.item2, u.item3, u.item4];
+      for (let s = 0; s < 4; s++) {
+        const desc = (slots[s] || '').trim();
+        if (desc) {
+          await c.query(`
+            INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status)
+            VALUES ($1,$2,$3,$4,$5,'pending')
+            ON CONFLICT (bos_id, unit, item_slot)
+            DO UPDATE SET description=EXCLUDED.description, vehicle_desc=EXCLUDED.vehicle_desc`,
+            [id, u.unit||'', vehDesc, s+1, desc]);
+        } else {
+          // item cleared from the BOS form → remove if it was still pending (keep done history)
+          await c.query(`DELETE FROM repair_items WHERE bos_id=$1 AND unit=$2 AND item_slot=$3 AND status='pending'`,
+            [id, u.unit||'', s+1]);
+        }
+      }
     }
   });
   await audit(username, 'create', 'bill_of_sale', id, { total: d.total, customer: d.personalName||d.businessName });

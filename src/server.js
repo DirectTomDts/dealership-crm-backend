@@ -1042,6 +1042,46 @@ app.delete('/lenders/:id', requireAuth, requireFeature('financing'), async (req,
   catch(e) { res.status(500).json({ error:'Failed to remove lender' }); }
 });
 
+// ── REPAIR / TO-FIX ITEMS (visible to all; anyone may clear) ──────────────────
+app.get('/repair-items', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`SELECT * FROM repair_items ORDER BY status ASC, created_at DESC`);
+    const pending = [], done = [];
+    for (const r of rows) {
+      const o = { id:r.id, bosId:r.bos_id, unit:r.unit, vehicleDesc:r.vehicle_desc,
+        slot:r.item_slot, description:r.description, status:r.status,
+        completedBy:r.completed_by||'', completedAt:r.completed_at, createdAt:r.created_at };
+      (r.status === 'done' ? done : pending).push(o);
+    }
+    // group pending by unit for the panel
+    const byUnit = {};
+    for (const p of pending) {
+      const key = p.unit || '(no unit)';
+      byUnit[key] = byUnit[key] || { unit:p.unit, vehicleDesc:p.vehicleDesc, items:[] };
+      byUnit[key].items.push(p);
+    }
+    res.json({ pendingByUnit: Object.values(byUnit), done, pendingCount: pending.length });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load repair items' }); }
+});
+
+app.post('/repair-items/:id/done', requireAuth, async (req, res) => {
+  try {
+    await pgQuery(`UPDATE repair_items SET status='done', completed_by=$2, completed_at=now() WHERE id=$1`,
+      [req.params.id, req.user.username]);
+    await audit2(req.user.username, 'complete', 'repair_item', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to mark done' }); }
+});
+
+// Re-open a completed item (undo)
+app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
+  try {
+    await pgQuery(`UPDATE repair_items SET status='pending', completed_by='', completed_at=NULL WHERE id=$1`, [req.params.id]);
+    await audit2(req.user.username, 'reopen', 'repair_item', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reopen' }); }
+});
+
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
 app.get('/search', requireAuth, async (req, res) => {
   try {
