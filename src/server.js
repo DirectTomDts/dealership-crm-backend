@@ -112,6 +112,11 @@ function getSheetsClient() {
   const auth = new google.auth.GoogleAuth({ credentials, scopes:['https://www.googleapis.com/auth/spreadsheets'] });
   return google.sheets({ version:'v4', auth });
 }
+function getDriveClient() {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  const auth = new google.auth.GoogleAuth({ credentials, scopes:['https://www.googleapis.com/auth/drive'] });
+  return google.drive({ version:'v3', auth });
+}
 
 // ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
 // ── ROLE PERMISSIONS ──────────────────────────────────────────────────────────
@@ -941,6 +946,7 @@ const FIN_FIELDS = ['lead_id','app_type','status','first_name','last_name','emai
   'business_state','business_zip','business_phone','dot_number','mc_number','num_trucks','annual_revenue',
   'unit','vehicle_desc','purchase_price','down_payment','amount_financed','term_months',
   'consent_signed','consent_date','credit_score','paynet_score','credit_notes',
+  'open_trades','first_time_buyer','avg_deposits','avg_daily_balance','nsf_count',
   'lender_id','lender_name','notes'];
 // camelCase (frontend) <-> snake_case (db)
 const toSnake = (s) => s.replace(/[A-Z]/g, m => '_' + m.toLowerCase());
@@ -977,8 +983,8 @@ app.post('/financing', requireAuth, requireFeature('financing'), async (req, res
     for (const snake of FIN_FIELDS) {
       const camel = toCamel(snake);
       let v = d[camel];
-      if (snake === 'consent_signed') v = (v === true || v === 'true') ? true : false;
-      if (v === undefined) v = (snake === 'consent_signed') ? false : '';
+      if (snake === 'consent_signed' || snake === 'first_time_buyer') v = (v === true || v === 'true') ? true : false;
+      if (v === undefined) v = (snake === 'consent_signed') ? false : (snake === 'first_time_buyer' ? true : '');
       cols.push(snake); vals.push(v); ph.push('$'+i); i++;
     }
     const existing = await pgQuery('SELECT id FROM financing_applications WHERE id=$1', [id]);
@@ -986,7 +992,7 @@ app.post('/financing', requireAuth, requireFeature('financing'), async (req, res
       // update
       const sets = FIN_FIELDS.map((s, idx) => `${s}=$${idx+2}`).join(', ');
       await pgQuery(`UPDATE financing_applications SET ${sets}, updated_at=now() WHERE id=$1`,
-        [id, ...FIN_FIELDS.map(s => { const c=toCamel(s); let v=d[c]; if(s==='consent_signed') v=(v===true||v==='true'); if(v===undefined) v=(s==='consent_signed'?false:''); return v; })]);
+        [id, ...FIN_FIELDS.map(s => { const c=toCamel(s); let v=d[c]; if(s==='consent_signed'||s==='first_time_buyer') v=(v===true||v==='true'); if(v===undefined) v=(s==='consent_signed'?false:(s==='first_time_buyer'?true:'')); return v; })]);
       await audit2(req.user.username, 'update', 'financing', id, null);
     } else {
       await pgQuery(`INSERT INTO financing_applications (${cols.join(',')}, created_by) VALUES (${ph.join(',')}, $${i})`,
@@ -1027,12 +1033,20 @@ app.get('/lenders', requireAuth, requireFeature('financing'), async (req, res) =
 app.post('/lenders', requireAuth, requireFeature('financing'), async (req, res) => {
   try {
     const d = sanitizeObj(req.body);
+    const ftOk = (d.firstTimeOk === false || d.firstTimeOk === 'false') ? false : true;
+    const crit = [d.minCredit||'', d.minPaynet||'', ftOk, d.minYearsBiz||'', d.maxTruckAge||'',
+      d.maxTruckMiles||'', d.minAmount||'', d.maxAmount||'', d.minDownPct||'', d.termsOffered||''];
     if (d.id) {
-      await pgQuery(`UPDATE lenders SET name=$2,contact=$3,email=$4,phone=$5,notes=$6,specialties=$7 WHERE id=$1`,
-        [d.id, d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'']);
+      await pgQuery(`UPDATE lenders SET name=$2,contact=$3,email=$4,phone=$5,notes=$6,specialties=$7,
+        min_credit=$8,min_paynet=$9,first_time_ok=$10,min_years_biz=$11,max_truck_age=$12,
+        max_truck_miles=$13,min_amount=$14,max_amount=$15,min_down_pct=$16,terms_offered=$17 WHERE id=$1`,
+        [d.id, d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'', ...crit]);
     } else {
-      await pgQuery(`INSERT INTO lenders (name,contact,email,phone,notes,specialties) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'']);
+      await pgQuery(`INSERT INTO lenders (name,contact,email,phone,notes,specialties,
+        min_credit,min_paynet,first_time_ok,min_years_biz,max_truck_age,max_truck_miles,
+        min_amount,max_amount,min_down_pct,terms_offered)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [d.name||'', d.contact||'', d.email||'', d.phone||'', d.notes||'', d.specialties||'', ...crit]);
     }
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save lender' }); }
@@ -1080,6 +1094,171 @@ app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
     await audit2(req.user.username, 'reopen', 'repair_item', req.params.id, null);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reopen' }); }
+});
+
+// ── LENDER OUTCOMES (approval/decline history) ────────────────────────────────
+app.post('/lender-outcomes', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    if (!d.lenderName && !d.lenderId) return res.status(400).json({ error:'Lender required' });
+    if (!['approved','declined'].includes(d.outcome)) return res.status(400).json({ error:"Outcome must be 'approved' or 'declined'" });
+    await pgQuery(`INSERT INTO lender_outcomes (lender_id, lender_name, financing_id, outcome,
+      credit_score, paynet_score, first_time, years_in_business, open_trades,
+      avg_deposits, avg_daily_balance, nsf_count, truck_year, truck_miles, amount, down_pct,
+      approved_term, approved_rate, notes, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+      [d.lenderId||null, d.lenderName||'', d.financingId||'', d.outcome,
+       d.creditScore||'', d.paynetScore||'', (d.firstTime===true||d.firstTime==='true'),
+       d.yearsInBusiness||'', d.openTrades||'', d.avgDeposits||'', d.avgDailyBalance||'',
+       d.nsfCount||'', d.truckYear||'', d.truckMiles||'', d.amount||'', d.downPct||'',
+       d.approvedTerm||'', d.approvedRate||'', d.notes||'', req.user.username]);
+    await audit2(req.user.username, 'create', 'lender_outcome', d.lenderName||String(d.lenderId), { outcome:d.outcome });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to log outcome' }); }
+});
+
+app.get('/lender-outcomes', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const { rows } = await pgQuery('SELECT * FROM lender_outcomes ORDER BY created_at DESC LIMIT 200');
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load outcomes' }); }
+});
+
+// ── LENDER MATCHING ENGINE ────────────────────────────────────────────────────
+// Input: client factors. Output: lenders that qualify by stated criteria, ranked
+// by REAL historical approval rate for similar client profiles, plus the lenders
+// that don't qualify and exactly why.
+app.post('/lender-match', requireAuth, requireFeature('financing'), async (req, res) => {
+  try {
+    const q = sanitizeObj(req.body);
+    const num = (v) => { const n = parseFloat(String(v??'').replace(/[^0-9.\-]/g,'')); return isNaN(n)?null:n; };
+    const c = {
+      credit: num(q.creditScore), paynet: num(q.paynetScore),
+      firstTime: (q.firstTime===true||q.firstTime==='true'),
+      yearsBiz: num(q.yearsInBusiness), openTrades: num(q.openTrades),
+      avgDeposits: num(q.avgDeposits), avgDailyBalance: num(q.avgDailyBalance), nsf: num(q.nsfCount),
+      truckYear: num(q.truckYear), truckMiles: num(q.truckMiles),
+      amount: num(q.amount), downPct: num(q.downPct),
+    };
+    const nowYear = new Date().getFullYear();
+    const truckAge = c.truckYear != null ? (nowYear - c.truckYear) : null;
+
+    const lenders = (await pgQuery('SELECT * FROM lenders WHERE active=TRUE ORDER BY name')).rows;
+    const outcomes = (await pgQuery('SELECT * FROM lender_outcomes')).rows;
+
+    // similarity: same first-time status, credit within ±50, amount within ±40%
+    const similarTo = (o) => {
+      if ((o.first_time===true) !== c.firstTime) return false;
+      const oc = num(o.credit_score);
+      if (c.credit != null && oc != null && Math.abs(oc - c.credit) > 50) return false;
+      const oa = num(o.amount);
+      if (c.amount != null && oa != null && (oa < c.amount*0.6 || oa > c.amount*1.4)) return false;
+      return true;
+    };
+
+    const qualified = [], notQualified = [];
+    for (const L of lenders) {
+      const fails = [];
+      const chk = (cond, msg) => { if (cond) fails.push(msg); };
+      const mn = (v) => num(v);
+      if (mn(L.min_credit) != null && c.credit != null && c.credit < mn(L.min_credit)) chk(true, `Credit ${c.credit} below minimum ${mn(L.min_credit)}`);
+      if (mn(L.min_paynet) != null && c.paynet != null && c.paynet < mn(L.min_paynet)) chk(true, `PayNet ${c.paynet} below minimum ${mn(L.min_paynet)}`);
+      if (L.first_time_ok === false && c.firstTime) chk(true, 'Does not accept first-time buyers');
+      if (mn(L.min_years_biz) != null && c.yearsBiz != null && c.yearsBiz < mn(L.min_years_biz)) chk(true, `${c.yearsBiz} yrs in business below minimum ${mn(L.min_years_biz)}`);
+      if (mn(L.max_truck_age) != null && truckAge != null && truckAge > mn(L.max_truck_age)) chk(true, `Truck age ${truckAge}yr over limit ${mn(L.max_truck_age)}`);
+      if (mn(L.max_truck_miles) != null && c.truckMiles != null && c.truckMiles > mn(L.max_truck_miles)) chk(true, `Miles ${c.truckMiles.toLocaleString()} over limit ${mn(L.max_truck_miles).toLocaleString()}`);
+      if (mn(L.min_amount) != null && c.amount != null && c.amount < mn(L.min_amount)) chk(true, `Amount below lender minimum $${mn(L.min_amount).toLocaleString()}`);
+      if (mn(L.max_amount) != null && c.amount != null && c.amount > mn(L.max_amount)) chk(true, `Amount above lender maximum $${mn(L.max_amount).toLocaleString()}`);
+      if (mn(L.min_down_pct) != null && c.downPct != null && c.downPct < mn(L.min_down_pct)) chk(true, `Down ${c.downPct}% below required ${mn(L.min_down_pct)}%`);
+
+      // history for this lender
+      const lo = outcomes.filter(o => (o.lender_id===L.id) || (o.lender_name && o.lender_name===L.name));
+      const sim = lo.filter(similarTo);
+      const simA = sim.filter(o=>o.outcome==='approved').length;
+      const simD = sim.filter(o=>o.outcome==='declined').length;
+      const allA = lo.filter(o=>o.outcome==='approved').length;
+      const allD = lo.filter(o=>o.outcome==='declined').length;
+      // Laplace-smoothed approval rate so 1-for-1 doesn't beat 8-for-10
+      const score = (simA + 1) / (simA + simD + 2);
+      const lastApproved = sim.filter(o=>o.outcome==='approved')
+        .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] || null;
+
+      const entry = {
+        id: L.id, name: L.name, email: L.email||'', specialties: L.specialties||'',
+        termsOffered: L.terms_offered||'',
+        history: {
+          similarApprovals: simA, similarDeclines: simD,
+          totalApprovals: allA, totalDeclines: allD,
+          similarRate: (simA+simD) ? Math.round(simA/(simA+simD)*100) : null,
+          lastApprovedTerms: lastApproved ? { term:lastApproved.approved_term, rate:lastApproved.approved_rate, when:lastApproved.created_at } : null,
+        },
+        score,
+      };
+      if (fails.length) { entry.reasons = fails; notQualified.push(entry); }
+      else qualified.push(entry);
+    }
+    qualified.sort((a,b) => b.score - a.score || (b.history.similarApprovals - a.history.similarApprovals));
+    res.json({ qualified, notQualified, clientSummary: c });
+  } catch(e) { console.error('lender match error', e); res.status(500).json({ error:'Match failed' }); }
+});
+
+// ── WORK ORDERS → Google Doc in shared shop folder (all roles) ────────────────
+app.post('/work-orders', requireAuth, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    const items = Array.isArray(d.items) ? d.items.filter(x => x && String(x).trim()) : [];
+    if (!d.unit && !items.length)
+      return res.status(400).json({ error:'A unit number and at least one issue are required' });
+
+    const folderId = process.env.WORK_ORDER_FOLDER_ID;
+    if (!folderId)
+      return res.status(400).json({ error:'Work-order folder not configured (set WORK_ORDER_FOLDER_ID to the shared Drive folder).' });
+
+    const inspectedBy = d.inspectedBy || (req.user && req.user.name) || (req.user && req.user.username) || '';
+    const date = d.date || new Date().toISOString().split('T')[0];
+    const priority = d.priority || 'Normal';
+    const esc = (s) => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+    // Build an HTML body; Drive converts text/html → a native Google Doc.
+    const rowsHtml = items.map((it,i) =>
+      `<tr><td style="padding:6px 10px;border:1px solid #ccc;">${i+1}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #ccc;">${esc(it)}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #ccc;">&#9744;</td></tr>`).join('');
+    const html = `<html><body style="font-family:Arial,sans-serif;">
+      <h1 style="margin-bottom:2px;">Work Order</h1>
+      <div style="color:#666;font-size:13px;margin-bottom:14px;">Direct Truck Sales Inc. — Shop</div>
+      <table style="font-size:14px;margin-bottom:16px;">
+        <tr><td style="padding:3px 12px 3px 0;color:#888;">Unit #</td><td style="font-weight:bold;">${esc(d.unit)}</td></tr>
+        <tr><td style="padding:3px 12px 3px 0;color:#888;">Vehicle</td><td>${esc(d.vehicleDesc||'')}</td></tr>
+        <tr><td style="padding:3px 12px 3px 0;color:#888;">Priority</td><td style="font-weight:bold;">${esc(priority)}</td></tr>
+        <tr><td style="padding:3px 12px 3px 0;color:#888;">Inspected by</td><td>${esc(inspectedBy)}</td></tr>
+        <tr><td style="padding:3px 12px 3px 0;color:#888;">Date</td><td>${esc(date)}</td></tr>
+      </table>
+      <h3 style="margin-bottom:4px;">Issues found</h3>
+      <table style="border-collapse:collapse;font-size:14px;width:100%;">
+        <tr style="background:#f0f0f0;"><th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">#</th>
+        <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Issue</th>
+        <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Done</th></tr>
+        ${rowsHtml}
+      </table>
+      ${d.notes ? `<h3 style="margin-bottom:4px;margin-top:16px;">Notes</h3><div style="font-size:14px;white-space:pre-wrap;">${esc(d.notes)}</div>` : ''}
+      </body></html>`;
+
+    const drive = getDriveClient();
+    const title = `Work Order — Unit ${d.unit||'?'} — ${date}`;
+    const created = await drive.files.create({
+      requestBody: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] },
+      media: { mimeType: 'text/html', body: html },
+      fields: 'id, webViewLink',
+      supportsAllDrives: true,
+    });
+    const link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
+    await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority });
+    res.json({ success:true, docId: created.data.id, link });
+  } catch(e) {
+    console.error('work order error', e);
+    res.status(500).json({ error:'Failed to create work order. The service account may need access to the shared folder.' });
+  }
 });
 
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
