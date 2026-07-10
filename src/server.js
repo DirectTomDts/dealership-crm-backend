@@ -1965,6 +1965,15 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
   } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
 });
 
+app.post('/billsofsale/:id/delete', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await pgQuery(`UPDATE bills_of_sale SET deleted_at=now(), deleted_by=$2 WHERE id=$1`,
+      [req.params.id, req.user.username]);
+    await audit2(req.user.username, 'delete', 'bill_of_sale', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to delete bill of sale' }); }
+});
+
 app.get('/billsofsale/:id', requireAuth, async (req, res) => {
   try {
     const all = await DBR.readBillsOfSale();
@@ -2005,12 +2014,21 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
         d.depositAmount||'',d.depositType||'',d.total||'',d.salesperson||'',
         d.item1||'',d.item2||'',d.item3||'',d.item4||'',d.leadId||'',
         d.units?JSON.stringify(d.units):'']);
+    // Look up any previous deposit on this id BEFORE the upsert, so edits that don't
+    // change the deposit won't re-notify (prevents duplicate deposit alerts on edits).
+    let prevDep = null, existedBefore = false;
+    try {
+      const pr = await pgQuery('SELECT deposit_amount FROM bills_of_sale WHERE id=$1', [id]);
+      if (pr.rows.length) { existedBefore = true; prevDep = parseFloat(String(pr.rows[0].deposit_amount||'').replace(/[^0-9.]/g,'')); if (isNaN(prevDep)) prevDep = 0; }
+    } catch(e) {}
+
     await DBW.mirrorBillOfSale(id, d, req.user && req.user.username);
     res.json({success:true,id});
     // Notify finance + owners when a deposit was taken (non-blocking, never throws)
     try {
       const dep = parseFloat(String(d.depositAmount||'').replace(/[^0-9.]/g,''));
-      if (!isNaN(dep) && dep > 0) {
+      const depositIsNew = !existedBefore || (prevDep != null && dep !== prevDep && dep > (prevDep||0));
+      if (!isNaN(dep) && dep > 0 && depositIsNew) {
         const savedBy = req.user && req.user.username;
         // 1) In-app notification for office + admin (you, Olia, finance roles)
         const c = MAIL.depositContent(d, savedBy);
