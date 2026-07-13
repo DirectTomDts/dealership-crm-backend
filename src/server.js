@@ -1203,6 +1203,47 @@ app.post('/lender-match', requireAuth, requireFeature('financing'), async (req, 
 });
 
 // ── WORK ORDERS → Google Doc in shared shop folder (all roles) ────────────────
+app.get('/debug/work-orders', requireAuth, requireAdmin, async (req, res) => {
+  const out = { folderIdSet: !!process.env.WORK_ORDER_FOLDER_ID, credsSet: !!process.env.GOOGLE_CREDENTIALS };
+  try {
+    const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS || '{}');
+    out.serviceAccountEmail = creds.client_email || '(missing client_email in GOOGLE_CREDENTIALS)';
+    out.projectId = creds.project_id || '';
+  } catch(e) { out.serviceAccountEmail = '(GOOGLE_CREDENTIALS is not valid JSON)'; }
+  const folderId = process.env.WORK_ORDER_FOLDER_ID;
+  out.folderId = folderId ? ('...' + String(folderId).slice(-8)) : '(not set)';
+  if (!folderId) { out.result = 'WORK_ORDER_FOLDER_ID env var is not set.'; return res.json(out); }
+  try {
+    const drive = getDriveClient();
+    // Try to read the folder's metadata — this tells us if the SA can see it at all.
+    const meta = await drive.files.get({ fileId: folderId, fields: 'id,name,mimeType,driveId', supportsAllDrives: true });
+    out.folderFound = true;
+    out.folderName = meta.data.name;
+    out.isSharedDrive = !!meta.data.driveId;
+    out.mimeType = meta.data.mimeType;
+    out.result = 'SUCCESS: the service account can see the folder. If creation still fails, it needs EDITOR (not just Viewer).';
+    // Try a lightweight create-and-delete to confirm write access
+    try {
+      const test = await drive.files.create({
+        requestBody: { name: '__wo_permission_test__', mimeType: 'application/vnd.google-apps.document', parents:[folderId] },
+        fields: 'id', supportsAllDrives: true,
+      });
+      await drive.files.delete({ fileId: test.data.id, supportsAllDrives: true });
+      out.canWrite = true;
+      out.result = 'SUCCESS: service account can read AND write to this folder. Work orders should work.';
+    } catch(werr) {
+      out.canWrite = false;
+      out.writeError = (werr && werr.message) ? werr.message : String(werr);
+      out.result = 'The service account can SEE the folder but cannot WRITE to it. Share the folder with the service account email as EDITOR (or add it as a member of the Shared Drive).';
+    }
+  } catch(e) {
+    out.folderFound = false;
+    out.driveError = (e && e.message) ? e.message : String(e);
+    out.result = 'The service account cannot access this folder ID. Either the folder is not shared with the service account email, or the WORK_ORDER_FOLDER_ID is wrong. Copy the ID from the folder URL and share the folder with the service account email above.';
+  }
+  res.json(out);
+});
+
 app.post('/work-orders', requireAuth, async (req, res) => {
   try {
     const d = sanitizeObj(req.body);
@@ -1257,7 +1298,8 @@ app.post('/work-orders', requireAuth, async (req, res) => {
     res.json({ success:true, docId: created.data.id, link });
   } catch(e) {
     console.error('work order error', e);
-    res.status(500).json({ error:'Failed to create work order. The service account may need access to the shared folder.' });
+    const msg = (e && e.message) ? e.message : 'unknown error';
+    res.status(500).json({ error:'Failed to create work order: ' + msg + ' — Admins: open the Work order screen and run the diagnostic for details.' });
   }
 });
 
