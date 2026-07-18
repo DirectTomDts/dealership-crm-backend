@@ -1210,36 +1210,72 @@ app.get('/debug/work-orders', requireAuth, requireAdmin, async (req, res) => {
     out.serviceAccountEmail = creds.client_email || '(missing client_email in GOOGLE_CREDENTIALS)';
     out.projectId = creds.project_id || '';
   } catch(e) { out.serviceAccountEmail = '(GOOGLE_CREDENTIALS is not valid JSON)'; }
-  const folderId = process.env.WORK_ORDER_FOLDER_ID;
-  out.folderId = folderId ? ('...' + String(folderId).slice(-8)) : '(not set)';
+
+  const folderId = (process.env.WORK_ORDER_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,'');
+  out.folderIdFull = folderId || '(not set)';
   if (!folderId) { out.result = 'WORK_ORDER_FOLDER_ID env var is not set.'; return res.json(out); }
+
+  let drive;
+  try { drive = getDriveClient(); }
+  catch(e) { out.result = 'Could not build Drive client: ' + e.message; return res.json(out); }
+
+  // 1) Try the exact folder, and capture the HTTP status (404 = cannot see, 403 = seen but forbidden)
   try {
-    const drive = getDriveClient();
-    // Try to read the folder's metadata — this tells us if the SA can see it at all.
-    const meta = await drive.files.get({ fileId: folderId, fields: 'id,name,mimeType,driveId', supportsAllDrives: true });
+    const meta = await drive.files.get({ fileId: folderId, fields:'id,name,mimeType,driveId,owners(emailAddress)', supportsAllDrives:true });
     out.folderFound = true;
     out.folderName = meta.data.name;
-    out.isSharedDrive = !!meta.data.driveId;
     out.mimeType = meta.data.mimeType;
-    out.result = 'SUCCESS: the service account can see the folder. If creation still fails, it needs EDITOR (not just Viewer).';
-    // Try a lightweight create-and-delete to confirm write access
+    out.isInSharedDrive = !!meta.data.driveId;
+    out.owner = (meta.data.owners && meta.data.owners[0]) ? meta.data.owners[0].emailAddress : '(hidden / shared drive)';
+  } catch(e) {
+    out.folderFound = false;
+    out.httpStatus = (e && e.code) ? e.code : (e.response && e.response.status) || '';
+    out.driveError = (e && e.message) ? e.message : String(e);
+  }
+
+  // 2) What Shared Drives is this service account a member of?
+  try {
+    const dl = await drive.drives.list({ pageSize: 20, fields: 'drives(id,name)' });
+    out.sharedDrivesVisible = (dl.data.drives || []).map(x => ({ id:x.id, name:x.name }));
+  } catch(e) { out.sharedDrivesVisible = 'error: ' + e.message; }
+
+  // 3) What folders can the service account see at all? (this proves whether the share landed)
+  try {
+    const fl = await drive.files.list({
+      q: "mimeType='application/vnd.google-apps.folder' and trashed=false",
+      fields: 'files(id,name,driveId)', pageSize: 25,
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    out.foldersVisibleToServiceAccount = (fl.data.files || []).map(f => ({ id:f.id, name:f.name, inSharedDrive: !!f.driveId }));
+    out.folderIsInVisibleList = (fl.data.files || []).some(f => f.id === folderId);
+  } catch(e) { out.foldersVisibleToServiceAccount = 'error: ' + e.message; }
+
+  // 4) Plain-language conclusion
+  if (out.folderFound) {
     try {
       const test = await drive.files.create({
-        requestBody: { name: '__wo_permission_test__', mimeType: 'application/vnd.google-apps.document', parents:[folderId] },
-        fields: 'id', supportsAllDrives: true,
+        requestBody: { name:'__wo_permission_test__', mimeType:'application/vnd.google-apps.document', parents:[folderId] },
+        fields:'id', supportsAllDrives:true,
       });
       await drive.files.delete({ fileId: test.data.id, supportsAllDrives: true });
       out.canWrite = true;
-      out.result = 'SUCCESS: service account can read AND write to this folder. Work orders should work.';
+      out.result = 'SUCCESS — the service account can read AND write this folder. Work orders should work now.';
     } catch(werr) {
       out.canWrite = false;
-      out.writeError = (werr && werr.message) ? werr.message : String(werr);
-      out.result = 'The service account can SEE the folder but cannot WRITE to it. Share the folder with the service account email as EDITOR (or add it as a member of the Shared Drive).';
+      out.writeError = werr.message || String(werr);
+      if (/storage quota/i.test(out.writeError)) {
+        out.result = 'The folder is visible but writing failed because SERVICE ACCOUNTS HAVE NO STORAGE QUOTA in a personal My Drive. Fix: move the work-order folder into a SHARED DRIVE and add the service account as a member (Content Manager). Files in a Shared Drive are owned by the drive, not the service account, so this restriction goes away.';
+      } else {
+        out.result = 'Folder is visible but not writable — give the service account EDITOR (not Viewer).';
+      }
     }
-  } catch(e) {
-    out.folderFound = false;
-    out.driveError = (e && e.message) ? e.message : String(e);
-    out.result = 'The service account cannot access this folder ID. Either the folder is not shared with the service account email, or the WORK_ORDER_FOLDER_ID is wrong. Copy the ID from the folder URL and share the folder with the service account email above.';
+  } else {
+    const visible = Array.isArray(out.foldersVisibleToServiceAccount) ? out.foldersVisibleToServiceAccount.length : 0;
+    out.result = 'Google returned "not found" for this ID. Google reports BOTH "missing" and "no access" as not-found. ' +
+      'The service account can currently see ' + visible + ' folder(s). ' +
+      (visible ? 'Compare the list above: if your work-order folder is NOT in it, the share never reached this service account. ' : 'It can see NOTHING, so no share has reached this service account yet. ') +
+      'Most common causes when a folder is owned by someone else: (a) the share was added to a different email/typo; (b) your Google Workspace admin blocks sharing outside the organization, so adding a service account silently fails; (c) the folder lives in a Shared Drive and the service account must be added as a MEMBER of that Shared Drive, not just the folder. ' +
+      'The period at the end of Google\'s message is only sentence punctuation, not part of the ID.';
   }
   res.json(out);
 });
@@ -1251,7 +1287,7 @@ app.post('/work-orders', requireAuth, async (req, res) => {
     if (!d.unit && !items.length)
       return res.status(400).json({ error:'A unit number and at least one issue are required' });
 
-    const folderId = process.env.WORK_ORDER_FOLDER_ID;
+    const folderId = (process.env.WORK_ORDER_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,'');
     if (!folderId)
       return res.status(400).json({ error:'Work-order folder not configured (set WORK_ORDER_FOLDER_ID to the shared Drive folder).' });
 
