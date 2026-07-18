@@ -1064,6 +1064,7 @@ app.get('/repair-items', requireAuth, async (req, res) => {
     for (const r of rows) {
       const o = { id:r.id, bosId:r.bos_id, unit:r.unit, vehicleDesc:r.vehicle_desc,
         slot:r.item_slot, description:r.description, status:r.status,
+        source:r.source||'bos', docLink:r.doc_link||'', priority:r.priority||'', createdBy:r.created_by||'',
         completedBy:r.completed_by||'', completedAt:r.completed_at, createdAt:r.created_at };
       (r.status === 'done' ? done : pending).push(o);
     }
@@ -1072,7 +1073,7 @@ app.get('/repair-items', requireAuth, async (req, res) => {
     for (const p of pending) {
       const key = p.unit || '(no unit)';
       byUnit[key] = byUnit[key] || { unit:p.unit, vehicleDesc:p.vehicleDesc, items:[] };
-      byUnit[key].items.push(p);
+      byUnit[key].items.push(p);  // p already carries source/docLink/priority
     }
     res.json({ pendingByUnit: Object.values(byUnit), done, pendingCount: pending.length });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load repair items' }); }
@@ -1330,8 +1331,21 @@ app.post('/work-orders', requireAuth, async (req, res) => {
       supportsAllDrives: true,
     });
     const link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
+
+    // Record each issue in repair_items so it appears in the Repairs panel for sales to verify.
+    const woKey = 'WO' + Date.now();
+    try {
+      for (let s = 0; s < items.length; s++) {
+        await pgQuery(`
+          INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by)
+          VALUES ($1,$2,$3,$4,$5,'pending','work_order',$6,$7,$8)
+          ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
+          [woKey, d.unit||'', d.vehicleDesc||'', s+1, items[s], link, priority, inspectedBy]);
+      }
+    } catch(recErr) { console.warn('[work-order] repair_items record failed:', recErr.message); }
+
     await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority });
-    res.json({ success:true, docId: created.data.id, link });
+    res.json({ success:true, docId: created.data.id, link, tracked: items.length });
   } catch(e) {
     console.error('work order error', e);
     const msg = (e && e.message) ? e.message : 'unknown error';
