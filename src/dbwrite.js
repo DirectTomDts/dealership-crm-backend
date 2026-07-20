@@ -117,11 +117,14 @@ const mirrorLeadEnrich = safe('lead enrich', async (leadId, client) => {
       phone     = CASE WHEN $13<>'' AND (phone='' OR phone IS NULL) THEN $13 ELSE phone END,
       email     = CASE WHEN $14<>'' AND (email='' OR email IS NULL) THEN $14 ELSE email END,
       company   = CASE WHEN $15<>'' AND (company='' OR company IS NULL) THEN $15 ELSE company END,
+      first_name = CASE WHEN $16<>'' AND (first_name='' OR first_name IS NULL OR first_name='Unknown') THEN $16 ELSE first_name END,
+      last_name  = CASE WHEN $17<>'' AND (last_name='' OR last_name IS NULL) THEN $17 ELSE last_name END,
+      unit      = CASE WHEN $18<>'' AND (unit='' OR unit IS NULL) THEN $18 ELSE unit END,
       updated_at = now()
     WHERE id=$1`,
     [leadId, c.address||'', c.city||'', c.state||'', c.zip||'', c.bizAddress||'', c.bizCity||'',
      c.bizState||'', c.bizZip||'', c.bizPhone||'', c.dlNumber||'', c.dlState||'',
-     c.phone||'', c.email||'', c.company||'']);
+     c.phone||'', c.email||'', c.company||'', c.firstName||'', c.lastName||'', c.unit||'']);
 });
 
 // ── TEST DRIVE ───────────────────────────────────────────────────────────────
