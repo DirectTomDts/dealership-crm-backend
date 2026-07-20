@@ -165,7 +165,7 @@ async function requireSourcing(req, res, next) {
   if (!req.user) return res.status(401).json({ error:'Not authenticated' });
   try {
     const { rows } = await pgQuery('SELECT sourcing_access FROM users WHERE username=$1', [req.user.username]);
-    const ok = rows.length ? !!rows[0].sourcing_access : (req.user.username === 'tom');
+    const ok = (req.user.username === 'tom') || (rows.length ? !!rows[0].sourcing_access : false);
     if (!ok) return res.status(403).json({ error:'You do not have access to sourcing' });
     next();
   } catch(e) { return res.status(500).json({ error:'Access check failed' }); }
@@ -344,7 +344,7 @@ app.post('/auth/login', async (req, res) => {
         const u = rows[0];
         if (u.active === false) return res.status(403).json({ error:'Account disabled' });
         const ok = await bcrypt.compare(password, u.password_hash);
-        if (ok) authed = { username:u.username, name:u.name, role:u.role, sourcing: !!u.sourcing_access };
+        if (ok) authed = { username:u.username, name:u.name, role:u.role, sourcing: (!!u.sourcing_access || u.username==='tom') };
         else return res.status(401).json({ error:'Invalid username or password' });
       }
     }
@@ -359,6 +359,19 @@ app.post('/auth/login', async (req, res) => {
 
   const token = jwt.sign(authed, JWT_SECRET, { expiresIn:'12h' });
   res.json({ token, name:authed.name, role:authed.role, permissions: permissionsFor(authed.role) });
+});
+
+// ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
+app.get('/me', requireAuth, async (req, res) => {
+  let sourcing = (req.user.username === 'tom');
+  try {
+    const { rows } = await pgQuery('SELECT sourcing_access FROM users WHERE username=$1', [req.user.username]);
+    if (rows.length && rows[0].sourcing_access) sourcing = true;
+  } catch(e) { /* column may not exist yet; tom still true */ }
+  res.json({
+    name: req.user.name, role: req.user.role,
+    permissions: Object.assign(permissionsFor(req.user.role), { sourcing }),
+  });
 });
 
 // ── DOWC ───────────────────────────────────────────────────────────────────────
