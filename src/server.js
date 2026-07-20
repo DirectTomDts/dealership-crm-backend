@@ -161,6 +161,16 @@ function requireFeature(feature) {
   };
 }
 
+async function requireSourcing(req, res, next) {
+  if (!req.user) return res.status(401).json({ error:'Not authenticated' });
+  try {
+    const { rows } = await pgQuery('SELECT sourcing_access FROM users WHERE username=$1', [req.user.username]);
+    const ok = rows.length ? !!rows[0].sourcing_access : (req.user.username === 'tom');
+    if (!ok) return res.status(403).json({ error:'You do not have access to sourcing' });
+    next();
+  } catch(e) { return res.status(500).json({ error:'Access check failed' }); }
+}
+
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error:'No token' });
@@ -329,12 +339,12 @@ app.post('/auth/login', async (req, res) => {
   let authed = null;
   try {
     if (await pgAvailable()) {
-      const { rows } = await pgQuery('SELECT username, password_hash, name, role, active FROM users WHERE username=$1', [uname]);
+      const { rows } = await pgQuery('SELECT username, password_hash, name, role, active, sourcing_access FROM users WHERE username=$1', [uname]);
       if (rows.length) {
         const u = rows[0];
         if (u.active === false) return res.status(403).json({ error:'Account disabled' });
         const ok = await bcrypt.compare(password, u.password_hash);
-        if (ok) authed = { username:u.username, name:u.name, role:u.role };
+        if (ok) authed = { username:u.username, name:u.name, role:u.role, sourcing: !!u.sourcing_access };
         else return res.status(401).json({ error:'Invalid username or password' });
       }
     }
@@ -344,7 +354,7 @@ app.post('/auth/login', async (req, res) => {
   if (!authed) {
     const u = USERS.find(x => x.username === uname && x.password === password);
     if (!u) return res.status(401).json({ error:'Invalid username or password' });
-    authed = { username:u.username, name:u.name, role:u.role };
+    authed = { username:u.username, name:u.name, role:u.role, sourcing: (u.username==='tom') };
   }
 
   const token = jwt.sign(authed, JWT_SECRET, { expiresIn:'12h' });
@@ -1351,6 +1361,122 @@ app.post('/work-orders', requireAuth, async (req, res) => {
     const msg = (e && e.message) ? e.message : 'unknown error';
     res.status(500).json({ error:'Failed to create work order: ' + msg + ' — Admins: open the Work order screen and run the diagnostic for details.' });
   }
+});
+
+// ── SOURCING (private acquisition pipeline; Tom + allowlisted users) ───────────
+const toCamelS = (s) => s.replace(/_([a-z0-9])/g, (_,c)=>c.toUpperCase());
+const SOURCING_FIELDS = ['name','dot_number','mc_number','contact_name','contact_phone','contact_email',
+  'city','state','fleet_size','cycle_years','last_purchase_year','next_contact_date','status','notes'];
+
+app.get('/sourcing/companies', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const { rows } = await pgQuery('SELECT * FROM sourcing_companies WHERE deleted_at IS NULL ORDER BY updated_at DESC');
+    const units = (await pgQuery('SELECT * FROM sourcing_units ORDER BY found_date DESC')).rows;
+    const byCo = {};
+    for (const u of units) { (byCo[u.company_id] = byCo[u.company_id] || []).push({
+      id:u.id, year:u.year, make:u.make, model:u.model, qty:u.qty, vin:u.vin,
+      foundWhere:u.found_where, foundDate:u.found_date, notes:u.notes }); }
+    res.json(rows.map(r => {
+      const o = {}; for (const k of Object.keys(r)) o[toCamelS(k)] = r[k];
+      o.units = byCo[r.id] || [];
+      return o;
+    }));
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load companies' }); }
+});
+
+app.post('/sourcing/companies', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    const id = d.id || 'SRC' + Date.now();
+    const vals = SOURCING_FIELDS.map(f => {
+      const camel = toCamelS(f);
+      let v = d[camel];
+      if (f === 'cycle_years') { v = parseFloat(v); if (isNaN(v)) v = 4; }
+      return (v === undefined || v === null) ? '' : v;
+    });
+    const exists = await pgQuery('SELECT id FROM sourcing_companies WHERE id=$1', [id]);
+    if (exists.rows.length) {
+      const sets = SOURCING_FIELDS.map((f,i) => `${f}=$${i+2}`).join(', ');
+      await pgQuery(`UPDATE sourcing_companies SET ${sets}, updated_at=now() WHERE id=$1`, [id, ...vals]);
+    } else {
+      const cols = SOURCING_FIELDS.join(','), ph = SOURCING_FIELDS.map((_,i)=>'$'+(i+2)).join(',');
+      await pgQuery(`INSERT INTO sourcing_companies (id,${cols},created_by) VALUES ($1,${ph},$${SOURCING_FIELDS.length+2})`,
+        [id, ...vals, req.user.username]);
+    }
+    res.json({ success:true, id });
+  } catch(e) { console.error('sourcing save', e); res.status(500).json({ error:'Failed to save company' }); }
+});
+
+app.post('/sourcing/companies/:id/delete', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    await pgQuery('UPDATE sourcing_companies SET deleted_at=now(), deleted_by=$2 WHERE id=$1', [req.params.id, req.user.username]);
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ error:'Failed to delete' }); }
+});
+
+// Units / sightings for a company
+app.post('/sourcing/units', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    if (!d.companyId) return res.status(400).json({ error:'companyId required' });
+    if (d.id) {
+      await pgQuery(`UPDATE sourcing_units SET year=$2,make=$3,model=$4,qty=$5,vin=$6,found_where=$7,found_date=$8,notes=$9 WHERE id=$1`,
+        [d.id, d.year||'', d.make||'', d.model||'', d.qty||'', d.vin||'', d.foundWhere||'', d.foundDate||'', d.notes||'']);
+    } else {
+      await pgQuery(`INSERT INTO sourcing_units (company_id,year,make,model,qty,vin,found_where,found_date,notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [d.companyId, d.year||'', d.make||'', d.model||'', d.qty||'', d.vin||'', d.foundWhere||'', d.foundDate||'', d.notes||'']);
+    }
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save unit' }); }
+});
+app.delete('/sourcing/units/:id', requireAuth, requireSourcing, async (req, res) => {
+  try { await pgQuery('DELETE FROM sourcing_units WHERE id=$1', [req.params.id]); res.json({ success:true }); }
+  catch(e) { res.status(500).json({ error:'Failed to delete unit' }); }
+});
+
+// FMCSA carrier lookup by USDOT number (free public API; needs FMCSA_API_KEY / webKey)
+app.get('/sourcing/fmcsa/:dot', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const key = process.env.FMCSA_API_KEY;
+    if (!key) return res.status(400).json({ error:'FMCSA lookup not configured. Set FMCSA_API_KEY (free webKey from FMCSA) in Railway.' });
+    const dot = String(req.params.dot).replace(/\D/g,'');
+    if (!dot) return res.status(400).json({ error:'Enter a numeric USDOT number' });
+    const url = `https://mobile.fmcsa.dot.gov/qc/services/carriers/${dot}?webKey=${encodeURIComponent(key)}`;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).json({ error:'FMCSA request failed ('+r.status+')' });
+    const j = await r.json();
+    const c = (j && j.content && j.content.carrier) ? j.content.carrier : null;
+    if (!c) return res.status(404).json({ error:'No carrier found for USDOT '+dot });
+    res.json({
+      name: c.legalName || c.dbaName || '',
+      dba: c.dbaName || '',
+      phone: c.telephone || '',
+      city: c.phyCity || '',
+      state: c.phyState || '',
+      fleetSize: (c.totalPowerUnits != null ? String(c.totalPowerUnits) : ''),
+      drivers: (c.totalDrivers != null ? String(c.totalDrivers) : ''),
+      dot: dot,
+    });
+  } catch(e) { console.error('fmcsa', e); res.status(500).json({ error:'FMCSA lookup failed: '+e.message }); }
+});
+
+// Access management (admins with sourcing can grant/revoke others)
+app.get('/sourcing/access', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error:'Only admins manage access' });
+    const { rows } = await pgQuery('SELECT username, name, role, sourcing_access FROM users WHERE active IS NOT FALSE ORDER BY username');
+    res.json(rows.map(u => ({ username:u.username, name:u.name, role:u.role, access: !!u.sourcing_access })));
+  } catch(e) { res.status(500).json({ error:'Failed to load access list' }); }
+});
+app.post('/sourcing/access', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error:'Only admins manage access' });
+    const { username, access } = sanitizeObj(req.body);
+    await pgQuery('UPDATE users SET sourcing_access=$2 WHERE username=$1', [username, access === true || access === 'true']);
+    await audit2(req.user.username, 'update', 'sourcing_access', username, { access });
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ error:'Failed to update access' }); }
 });
 
 // ── GLOBAL SEARCH (all record types) ──────────────────────────────────────────
