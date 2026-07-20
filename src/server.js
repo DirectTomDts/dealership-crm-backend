@@ -369,7 +369,7 @@ app.get('/me', requireAuth, async (req, res) => {
     if (rows.length && rows[0].sourcing_access) sourcing = true;
   } catch(e) { /* column may not exist yet; tom still true */ }
   res.json({
-    name: req.user.name, role: req.user.role,
+    name: req.user.name, role: req.user.role, username: req.user.username,
     permissions: Object.assign(permissionsFor(req.user.role), { sourcing }),
   });
 });
