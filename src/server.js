@@ -1531,19 +1531,22 @@ app.get('/search', requireAuth, async (req, res) => {
     });
 
     // Bills of sale
+    const numTerm = digits.length ? digits : '__nonum__';
     const bos = (await pgQuery(`
-      SELECT b.id, b.personal_name, b.business_name, b.total, b.lead_id,
+      SELECT b.id, b.personal_name, b.business_name, b.total, b.lead_id, b.bos_number, b.completion_status,
         string_agg(u.vin,', ') FILTER (WHERE u.vin<>'') AS vins,
         string_agg(u.unit,', ') FILTER (WHERE u.unit<>'') AS units
       FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id=b.id
-      WHERE lower(b.personal_name) LIKE $1 OR lower(b.business_name) LIKE $1
+      WHERE b.deleted_at IS NULL AND (
+        lower(b.personal_name) LIKE $1 OR lower(b.business_name) LIKE $1
         OR lower(u.vin) LIKE $1 OR lower(u.unit) LIKE $1
-      GROUP BY b.id LIMIT 12`, [term])).rows;
+        OR CAST(b.bos_number AS TEXT) LIKE $3)
+      GROUP BY b.id LIMIT 12`, [term, phoneTerm, '%'+numTerm+'%'])).rows;
     for (const b of bos) results.push({
       type: 'bill_of_sale', id: b.id, leadId: b.lead_id || '',
-      title: b.personal_name || b.business_name || b.id,
+      title: (b.bos_number ? '#'+b.bos_number+' — ' : '') + (b.personal_name || b.business_name || b.id),
       sub: [b.units ? 'Unit '+b.units : '', b.total ? '$'+Number(b.total).toLocaleString() : ''].filter(Boolean).join(' · '),
-      tag: 'Bill of Sale',
+      tag: b.bos_number ? ('BOS #'+b.bos_number) : 'Bill of Sale',
     });
 
     // Closing packages
@@ -1651,7 +1654,9 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     const nextMonth = new Date(hiParts[0], hiParts[1], 1).toISOString().split('T')[0]; // first day after hi
 
     // Pull the raw data we need
-    const bos = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at FROM bills_of_sale')).rows;
+    const bosAll = (await pgQuery('SELECT id, lead_id, bos_date, total, salesperson, created_at, completion_status FROM bills_of_sale WHERE deleted_at IS NULL')).rows;
+    // Only COMPLETED bills of sale count toward revenue/units. Others tracked separately.
+    const bos = bosAll.filter(b => (b.completion_status||'Completed') === 'Completed');
     const leads = (await pgQuery('SELECT id, status, salesperson, source, created_at FROM leads')).rows;
     const inv = (await pgQuery('SELECT unit, status, date_added FROM inventory')).rows;
 
@@ -1723,6 +1728,14 @@ app.get('/dashboard', requireAuth, requireAdmin, async (req, res) => {
     res.json({
       month: (lo === hi) ? lo : (lo + ' to ' + hi),
       rangeFrom: lo, rangeTo: hi,
+      excluded: (function(){
+        const inR = (r) => { const dd = effDate(r); return dd >= rangeStart && dd < nextMonth; };
+        const ex = bosAll.filter(b => (b.completion_status||'Completed') !== 'Completed' && inR(b));
+        const by = { Draft:0, Cancelled:0, Superseded:0 };
+        let exVal = 0;
+        ex.forEach(b => { const s=b.completion_status||'Draft'; by[s]=(by[s]||0)+1; exVal += num(b.total); });
+        return { count: ex.length, value: Math.round(exVal), byStatus: by };
+      })(),
       unitsSoldMonth, grossMonth, grossAll,
       salesByPerson: Object.values(byPerson).sort((a,b)=>b.revenue-a.revenue),
       avgDaysToSale,
@@ -1998,6 +2011,11 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 
     const p1=pdfDoc.addPage([W,H]);
     let y=await addHeader(p1,'BILL OF SALE');
+    // Bill-of-sale number (invoice-style), if assigned
+    if (d.bosNumber) {
+      const noStr = 'BILL OF SALE #' + d.bosNumber;
+      dt(p1, noStr, W - M - (String(noStr).length*6.2), y+6, { bold:true, size:10 });
+    }
     const LBL=86,VAL=W/2-M-LBL-8,col1=M+6,col2=W/2+6;
     const row=(pg,yp,l1,v1,l2,v2)=>{
       dt(pg,l1,col1,yp,{bold:true,size:8.5});dt(pg,v1||'',col1+LBL,yp,{size:8.5,maxWidth:VAL});
@@ -2196,6 +2214,17 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
   } catch(e){ console.error('BOS PDF error:',e); res.status(500).json({error:'PDF generation failed: '+e.message}); }
 });
 
+app.post('/billsofsale/:id/status', requireAuth, async (req, res) => {
+  try {
+    const status = String((req.body && req.body.status) || '').trim();
+    const allowed = ['Draft','Completed','Cancelled','Superseded'];
+    if (!allowed.includes(status)) return res.status(400).json({ error:'Invalid status' });
+    await pgQuery('UPDATE bills_of_sale SET completion_status=$2 WHERE id=$1', [req.params.id, status]);
+    await audit2(req.user.username, 'update', 'bill_of_sale_status', req.params.id, { status });
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to update status' }); }
+});
+
 app.post('/billsofsale/:id/delete', requireAuth, requireAdmin, async (req, res) => {
   try {
     await pgQuery(`UPDATE bills_of_sale SET deleted_at=now(), deleted_by=$2 WHERE id=$1`,
@@ -2254,7 +2283,9 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
     } catch(e) {}
 
     await DBW.mirrorBillOfSale(id, d, req.user && req.user.username);
-    res.json({success:true,id});
+    let bosNumber = null;
+    try { const nr = await pgQuery('SELECT bos_number FROM bills_of_sale WHERE id=$1', [id]); if (nr.rows.length) bosNumber = nr.rows[0].bos_number; } catch(e) {}
+    res.json({success:true, id, bosNumber});
     // Notify finance + owners when a deposit was taken (non-blocking, never throws)
     try {
       const dep = parseFloat(String(d.depositAmount||'').replace(/[^0-9.]/g,''));

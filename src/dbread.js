@@ -107,7 +107,8 @@ async function readBillsOfSale() {
       titleFee:first.titleFee||'', docFee:first.docFee||'',
       depositAmount:b.deposit_amount||'', depositType:b.deposit_type||'', total:b.total||'',
       salesperson:b.salesperson||'', item1:first.item1||'', item2:first.item2||'', item3:first.item3||'',
-      item4:first.item4||'', leadId:b.lead_id||'', driveLink:b.drive_link||'', units,
+      item4:first.item4||'', leadId:b.lead_id||'', driveLink:b.drive_link||'',
+      completionStatus: b.completion_status||'Draft', bosNumber: b.bos_number||null, units,
     });
   }
   return out;
