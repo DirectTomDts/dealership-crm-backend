@@ -15,7 +15,7 @@ const { query } = require('./db');
 async function readLeads() {
   const { rows } = await query(`SELECT * FROM leads WHERE deleted_at IS NULL ORDER BY created_at ASC`);
   // Pull all deal-type records once, group by lead_id, to rebuild the "deals" array
-  const deals = await buildDealsByLead();
+  const deals = await buildDealsByLead(rows);
   return rows.map((r, i) => ({
     rowIndex: i + 1,
     id: r.id, first: r.first_name||'', last: r.last_name||'', company: r.company||'',
@@ -33,19 +33,42 @@ async function readLeads() {
 
 // Rebuild the per-lead deal history from the relational tables (replaces the
 // old deals-JSON column). Newest first.
-async function buildDealsByLead() {
+async function buildDealsByLead(leadRows) {
   const out = {};
   const push = (leadId, d) => { if (!leadId) return; (out[leadId] = out[leadId] || []).push(d); };
 
+  // Lookup maps so unlinked bills of sale can still be matched to a lead.
+  const digits = (s) => String(s||'').replace(/\D/g,'');
+  const phoneMap = {}, nameMap = {}, companyMap = {};
+  for (const l of (leadRows||[])) {
+    const ph = digits(l.phone); if (ph.length >= 7) phoneMap[ph] = phoneMap[ph] || l.id;
+    const nm = (`${l.first_name||''} ${l.last_name||''}`).trim().toLowerCase(); if (nm) nameMap[nm] = nameMap[nm] || l.id;
+    const co = String(l.company||'').trim().toLowerCase(); if (co) companyMap[co] = companyMap[co] || l.id;
+  }
+  const matchLead = (b) => {
+    const ph = digits(b.phone); if (ph.length >= 7 && phoneMap[ph]) return phoneMap[ph];
+    const pn = String(b.personal_name||'').trim().toLowerCase(); if (pn && nameMap[pn]) return nameMap[pn];
+    const bn = String(b.business_name||'').trim().toLowerCase(); if (bn && companyMap[bn]) return companyMap[bn];
+    return null;
+  };
+
+  // Include ALL bills of sale (linked or not); resolve a lead for the unlinked ones.
   const bos = await query(`
-    SELECT b.id, b.lead_id, b.bos_date, b.total, b.drive_link,
+    SELECT b.id, b.lead_id, b.bos_date, b.total, b.drive_link, b.bos_number,
+           b.personal_name, b.business_name, b.phone, b.completion_status,
            string_agg(u.unit, ', ') FILTER (WHERE u.unit <> '') AS units,
            string_agg(trim(concat_ws(' ', u.year, u.make, u.model)), ' | ') AS descs,
            string_agg(u.vin, ', ') FILTER (WHERE u.vin <> '') AS vins
     FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id = b.id
-    WHERE b.lead_id IS NOT NULL AND b.deleted_at IS NULL
+    WHERE b.deleted_at IS NULL
     GROUP BY b.id ORDER BY b.created_at DESC`);
-  for (const r of bos.rows) push(r.lead_id, { t:'Bill of Sale', id:r.id, d:r.bos_date||'', u:r.units||'', desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'' });
+  for (const r of bos.rows) {
+    const leadId = r.lead_id || matchLead(r);
+    if (!leadId) continue;
+    push(leadId, { t:'Bill of Sale', id:r.id, num:r.bos_number||null, d:r.bos_date||'', u:r.units||'',
+      desc:(r.descs||'').trim(), vin:r.vins||'', amt:r.total||'', link:r.drive_link||'',
+      status:r.completion_status||'', matched: !r.lead_id });
+  }
 
   const td = await query(`SELECT * FROM test_drives WHERE lead_id IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC`);
   for (const r of td.rows) push(r.lead_id, { t:'Test Drive', d:r.drive_date||'', u:r.unit||'', desc:`${r.make||''} ${r.model||''}`.trim(), vin:r.vin||'', amt:'', link:r.drive_link||'' });
