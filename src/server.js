@@ -1379,7 +1379,8 @@ app.post('/work-orders', requireAuth, async (req, res) => {
 // ── SOURCING (private acquisition pipeline; Tom + allowlisted users) ───────────
 const toCamelS = (s) => s.replace(/_([a-z0-9])/g, (_,c)=>c.toUpperCase());
 const SOURCING_FIELDS = ['name','dot_number','mc_number','contact_name','contact_phone','contact_email',
-  'city','state','fleet_size','cycle_years','last_purchase_year','next_contact_date','status','notes'];
+  'city','state','fleet_size','cycle_years','last_purchase_year','next_contact_date','status','notes',
+  'contact_role','trucks_run','cycle_notes','disposal_method','typical_tradein','available_now','interest'];
 
 app.get('/sourcing/companies', requireAuth, requireSourcing, async (req, res) => {
   try {
@@ -1389,9 +1390,16 @@ app.get('/sourcing/companies', requireAuth, requireSourcing, async (req, res) =>
     for (const u of units) { (byCo[u.company_id] = byCo[u.company_id] || []).push({
       id:u.id, year:u.year, make:u.make, model:u.model, qty:u.qty, vin:u.vin,
       foundWhere:u.found_where, foundDate:u.found_date, notes:u.notes }); }
+    const calls = (await pgQuery('SELECT * FROM sourcing_calls ORDER BY call_date DESC, id DESC')).rows;
+    const callsByCo = {};
+    for (const c of calls) { (callsByCo[c.company_id] = callsByCo[c.company_id] || []).push({
+      id:c.id, callDate:c.call_date, contactName:c.contact_name, interest:c.interest,
+      availableNow:c.available_now, outcome:c.outcome, nextFollowup:c.next_followup,
+      createdBy:c.created_by, createdAt:c.created_at }); }
     res.json(rows.map(r => {
       const o = {}; for (const k of Object.keys(r)) o[toCamelS(k)] = r[k];
       o.units = byCo[r.id] || [];
+      o.calls = callsByCo[r.id] || [];
       return o;
     }));
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load companies' }); }
@@ -1446,6 +1454,34 @@ app.post('/sourcing/units', requireAuth, requireSourcing, async (req, res) => {
 app.delete('/sourcing/units/:id', requireAuth, requireSourcing, async (req, res) => {
   try { await pgQuery('DELETE FROM sourcing_units WHERE id=$1', [req.params.id]); res.json({ success:true }); }
   catch(e) { res.status(500).json({ error:'Failed to delete unit' }); }
+});
+
+// Call log — one row per touchpoint. Logging a call can advance the follow-up date
+// and update the company's current interest, so the "contact soon" list stays honest.
+app.post('/sourcing/calls', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    if (!d.companyId) return res.status(400).json({ error:'companyId required' });
+    if (d.id) {
+      await pgQuery(`UPDATE sourcing_calls SET call_date=$2, contact_name=$3, interest=$4, available_now=$5, outcome=$6, next_followup=$7 WHERE id=$1`,
+        [d.id, d.callDate||'', d.contactName||'', d.interest||'', d.availableNow||'', d.outcome||'', d.nextFollowup||'']);
+    } else {
+      await pgQuery(`INSERT INTO sourcing_calls (company_id, call_date, contact_name, interest, available_now, outcome, next_followup, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [d.companyId, d.callDate||'', d.contactName||'', d.interest||'', d.availableNow||'', d.outcome||'', d.nextFollowup||'', req.user.username]);
+    }
+    // Roll the call's follow-up + interest up onto the company record.
+    const sets = [], vals = [d.companyId]; let n = 2;
+    if (d.nextFollowup) { sets.push(`next_contact_date=$${n++}`); vals.push(d.nextFollowup); }
+    if (d.interest)     { sets.push(`interest=$${n++}`); vals.push(d.interest); }
+    if (d.availableNow) { sets.push(`available_now=$${n++}`); vals.push(d.availableNow); }
+    if (sets.length) { await pgQuery(`UPDATE sourcing_companies SET ${sets.join(', ')}, updated_at=now() WHERE id=$1`, vals); }
+    res.json({ success:true });
+  } catch(e) { console.error('sourcing call', e); res.status(500).json({ error:'Failed to save call' }); }
+});
+app.delete('/sourcing/calls/:id', requireAuth, requireSourcing, async (req, res) => {
+  try { await pgQuery('DELETE FROM sourcing_calls WHERE id=$1', [req.params.id]); res.json({ success:true }); }
+  catch(e) { res.status(500).json({ error:'Failed to delete call' }); }
 });
 
 // FMCSA carrier lookup by USDOT number (free public API; needs FMCSA_API_KEY / webKey)
