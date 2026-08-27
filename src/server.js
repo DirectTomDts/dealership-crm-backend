@@ -1484,6 +1484,81 @@ app.delete('/sourcing/calls/:id', requireAuth, requireSourcing, async (req, res)
   catch(e) { res.status(500).json({ error:'Failed to delete call' }); }
 });
 
+// ── FACTORY WARRANTY LOOKUP ───────────────────────────────────────────────────
+// PDFs named by unit number live in a shared-drive folder (WARRANTY_FOLDER_ID).
+// Any authenticated CRM user can look one up and stream it for viewing/printing;
+// the service account does the Drive access, so the user needs no Google access.
+function warrantyFolderId() {
+  return (process.env.WARRANTY_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,'');
+}
+
+// Search the warranty folder for PDF(s) matching a unit number.
+app.get('/warranty/search', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.status(400).json({ error:'Warranty folder not configured (set WARRANTY_FOLDER_ID to the shared Drive folder).' });
+    const unit = String(req.query.unit || '').trim();
+    if (!unit) return res.json({ found:false, files:[] });
+    const safe = unit.replace(/['\\]/g, '');   // escape for the Drive query string
+    const drive = getDriveClient();
+    const q = `'${folderId}' in parents and trashed=false and mimeType='application/pdf' and name contains '${safe}'`;
+    const list = await drive.files.list({
+      q, fields:'files(id,name)', pageSize:25,
+      supportsAllDrives:true, includeItemsFromAllDrives:true
+    });
+    const files = (list.data.files || []).map(f => ({ id:f.id, name:f.name }));
+    // Prefer an exact "<unit>.pdf" match first, then other name-contains matches.
+    const exact = files.filter(f => f.name.toLowerCase() === (unit.toLowerCase()+'.pdf'));
+    const rest  = files.filter(f => f.name.toLowerCase() !== (unit.toLowerCase()+'.pdf'));
+    const ordered = exact.concat(rest);
+    res.json({ found: ordered.length > 0, files: ordered });
+  } catch(e) { console.error('warranty search', e); res.status(500).json({ error:'Warranty search failed' }); }
+});
+
+// Stream a warranty PDF by file id (only if it lives in the warranty folder).
+app.get('/warranty/file/:fileId', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.status(400).json({ error:'Warranty folder not configured.' });
+    const fileId = String(req.params.fileId || '').trim();
+    const drive = getDriveClient();
+    // Security: confirm the file is inside the warranty folder before streaming it.
+    const meta = await drive.files.get({ fileId, fields:'id,name,mimeType,parents', supportsAllDrives:true });
+    const parents = meta.data.parents || [];
+    if (!parents.includes(folderId)) return res.status(403).json({ error:'File is not in the warranty folder.' });
+    if (meta.data.mimeType !== 'application/pdf') return res.status(400).json({ error:'File is not a PDF.' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="' + (meta.data.name || 'warranty.pdf').replace(/"/g,'') + '"');
+    const stream = await drive.files.get(
+      { fileId, alt:'media', supportsAllDrives:true },
+      { responseType:'stream' }
+    );
+    stream.data.on('error', err => { console.error('warranty stream', err); if (!res.headersSent) res.status(500).end(); });
+    stream.data.pipe(res);
+  } catch(e) { console.error('warranty file', e); res.status(500).json({ error:'Could not load warranty file' }); }
+});
+
+// Admin diagnostic for warranty folder configuration.
+app.get('/debug/warranty', requireAuth, requireAdmin, async (req, res) => {
+  const out = { folderIdSet: !!process.env.WARRANTY_FOLDER_ID, credsSet: !!process.env.GOOGLE_CREDENTIALS };
+  const folderId = warrantyFolderId();
+  out.folderId = folderId || null;
+  if (!folderId) { out.result = 'WARRANTY_FOLDER_ID env var is not set.'; return res.json(out); }
+  try {
+    const drive = getDriveClient();
+    const meta = await drive.files.get({ fileId: folderId, fields:'id,name,mimeType,driveId', supportsAllDrives:true });
+    out.folderName = meta.data.name; out.isSharedDrive = !!meta.data.driveId;
+    const fl = await drive.files.list({
+      q:`'${folderId}' in parents and trashed=false and mimeType='application/pdf'`,
+      fields:'files(id,name)', pageSize:10, supportsAllDrives:true, includeItemsFromAllDrives:true
+    });
+    out.samplePdfs = (fl.data.files || []).map(f => f.name);
+    out.pdfCount = out.samplePdfs.length;
+    out.result = 'OK — folder reachable.';
+  } catch(e) { out.result = 'Error: ' + (e.message || e); }
+  res.json(out);
+});
+
 // FMCSA carrier lookup by USDOT number (free public API; needs FMCSA_API_KEY / webKey)
 app.get('/sourcing/fmcsa/:dot', requireAuth, requireSourcing, async (req, res) => {
   try {
