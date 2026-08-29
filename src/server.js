@@ -1515,6 +1515,27 @@ app.get('/warranty/search', requireAuth, async (req, res) => {
   } catch(e) { console.error('warranty search', e); res.status(500).json({ error:'Warranty search failed' }); }
 });
 
+// List every warranty PDF in the folder (id, name, and stem = name without .pdf),
+// so the inventory can show a Yes/No column without a Drive call per row.
+app.get('/warranty/list', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.json({ files: [], configured:false });
+    const drive = getDriveClient();
+    const files = []; let pageToken;
+    do {
+      const list = await drive.files.list({
+        q:`'${folderId}' in parents and trashed=false and mimeType='application/pdf'`,
+        fields:'nextPageToken, files(id,name)', pageSize:1000, pageToken,
+        supportsAllDrives:true, includeItemsFromAllDrives:true
+      });
+      (list.data.files || []).forEach(f => files.push({ id:f.id, name:f.name, stem:f.name.replace(/\.pdf$/i,'') }));
+      pageToken = list.data.nextPageToken;
+    } while (pageToken);
+    res.json({ files, configured:true });
+  } catch(e) { console.error('warranty list', e); res.status(500).json({ error:'Warranty list failed' }); }
+});
+
 // Stream a warranty PDF by file id (only if it lives in the warranty folder).
 app.get('/warranty/file/:fileId', requireAuth, async (req, res) => {
   try {
