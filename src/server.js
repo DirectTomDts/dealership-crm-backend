@@ -1168,7 +1168,7 @@ app.get('/repair-items', requireAuth, async (req, res) => {
     for (const r of rows) {
       const o = { id:r.id, bosId:r.bos_id, unit:r.unit, vehicleDesc:r.vehicle_desc,
         slot:r.item_slot, description:r.description, status:r.status,
-        source:r.source||'bos', docLink:r.doc_link||'', priority:r.priority||'', createdBy:r.created_by||'',
+        source:r.source||'bos', docLink:r.doc_link||'', priority:r.priority||'', createdBy:r.created_by||'', approval:r.approval||'',
         completedBy:r.completed_by||'', completedAt:r.completed_at, createdAt:r.created_at };
       (r.status === 'done' ? done : pending).push(o);
     }
@@ -1199,6 +1199,22 @@ app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
     await audit2(req.user.username, 'reopen', 'repair_item', req.params.id, null);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reopen' }); }
+});
+
+// Sales approval for mechanic-added items: approved (light blue) / rejected (red).
+app.post('/repair-items/:id/approve', requireAuth, async (req, res) => {
+  try {
+    await pgQuery(`UPDATE repair_items SET approval='approved' WHERE id=$1`, [req.params.id]);
+    await audit2(req.user.username, 'approve', 'repair_item', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to approve' }); }
+});
+app.post('/repair-items/:id/reject', requireAuth, async (req, res) => {
+  try {
+    await pgQuery(`UPDATE repair_items SET approval='rejected' WHERE id=$1`, [req.params.id]);
+    await audit2(req.user.username, 'reject', 'repair_item', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reject' }); }
 });
 
 // ── LENDER OUTCOMES (approval/decline history) ────────────────────────────────
@@ -1599,8 +1615,8 @@ async function syncOneWorkOrder(wo, username) {
       }
     } else {
       maxSlot++;
-      await pgQuery(`INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id, completed_by, completed_at)
-        VALUES ($1,$2,$3,$4,$5,$6,'work_order',$7,$8,$9,$10,$11,$12,$13)
+      await pgQuery(`INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id, completed_by, completed_at, approval)
+        VALUES ($1,$2,$3,$4,$5,$6,'work_order',$7,$8,$9,$10,$11,$12,$13,'pending')
         ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
         [wo.wo_key, wo.unit||'', wo.vehicle_desc||'', maxSlot, r.text, doneNow?'done':'pending',
          wo.sheet_link||'', wo.priority||'', 'mechanic (sheet)', r.row, wo.sheet_id,
