@@ -151,13 +151,14 @@ async function createWorkOrderSheet(o) {
     { range:`${tab}!B4`, values:[[o.vin||'']] },
     { range:`${tab}!C4`, values:[[o.unit||'']] },
     { range:`${tab}!D4`, values:[[o.miles||'']] },
-    { range:`${tab}!L15`, values:[['ALL DONE:']] }
+    { range:`${tab}!L15`, values:[['APPROVED']] },
+    { range:`${tab}!N15`, values:[['ALL DONE:']] }
   ];
   if (o.items && o.items.length) data.push({ range:`${tab}!K${listStart}:K${listStart + o.items.length - 1}`, values:o.items.map(t=>[t]) });
   await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody:{ valueInputOption:'USER_ENTERED', data } });
-  // ALL DONE checkbox at M15
+  // ALL DONE checkbox at O15 (col index 14)
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
-    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:12, endColumnIndex:13 },
+    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:14, endColumnIndex:15 },
       cell:{ dataValidation:{ condition:{ type:'BOOLEAN' } }, userEnteredValue:{ boolValue:false } },
       fields:'dataValidation,userEnteredValue' } }
   ] } });
@@ -171,13 +172,13 @@ async function readWorkOrderSheet(sheetId, tab, listStart) {
   const endRow = listStart + 100;
   const resp = await sheets.spreadsheets.get({
     spreadsheetId: sheetId,
-    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!M15`],
+    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!O15`, `${tab}!M15`],
     includeGridData: true,
     fields: 'sheets(data(rowData(values(formattedValue,effectiveValue,effectiveFormat/backgroundColor))))'
   });
   const grids = (resp.data.sheets && resp.data.sheets[0] && resp.data.sheets[0].data) || [];
   const listGrid = grids[0] || {};
-  const doneGrid = grids[1] || {};
+  const doneGrids = [grids[1], grids[2]];   // O15 (current) and M15 (older sheets)
   const rows = [];
   const rowData = listGrid.rowData || [];
   for (let i = 0; i < rowData.length; i++) {
@@ -187,15 +188,36 @@ async function readWorkOrderSheet(sheetId, tab, listStart) {
     rows.push({ row: listStart + i, text, yellow });
   }
   let allDone = false;
-  try {
-    const dc = doneGrid.rowData && doneGrid.rowData[0] && doneGrid.rowData[0].values && doneGrid.rowData[0].values[0];
-    if (dc) {
-      if (dc.effectiveValue && dc.effectiveValue.boolValue === true) allDone = true;
-      const fv = (dc.formattedValue || '').trim().toLowerCase();
-      if (['true','yes','done','all done','complete'].includes(fv)) allDone = true;
-    }
-  } catch(e) {}
+  for (const g of doneGrids) {
+    try {
+      const dc = g && g.rowData && g.rowData[0] && g.rowData[0].values && g.rowData[0].values[0];
+      if (dc) {
+        if (dc.effectiveValue && dc.effectiveValue.boolValue === true) allDone = true;
+        const fv = (dc.formattedValue || '').trim().toLowerCase();
+        if (['true','yes','done','all done','complete'].includes(fv)) allDone = true;
+      }
+    } catch(e) {}
+  }
   return { rows, allDone };
+}
+
+// Reflect a sales approval decision on the mechanic's sheet: colour the APPROVED cell
+// (column L) next to the item — light blue = approved, red = not approved, clear = undecided.
+async function setApprovalColor(sheetId, listRow, decision) {
+  if (!sheetId || !listRow) return;
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,index)' });
+  const first = (meta.data.sheets || []).slice().sort((a,b)=>(a.properties.index||0)-(b.properties.index||0))[0];
+  const gridId = first ? first.properties.sheetId : 0;
+  let color;
+  if (decision === 'approved')      color = { red:0.624, green:0.773, blue:0.910 }; // #9FC5E8 light blue
+  else if (decision === 'rejected') color = { red:0.878, green:0.400, blue:0.400 }; // #E06666 red
+  else                              color = { red:1, green:1, blue:1 };             // clear
+  const rowIdx = listRow - 1, col = 11; // column L
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
+    { repeatCell: { range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:col, endColumnIndex:col+1 },
+      cell:{ userEnteredFormat:{ backgroundColor: color } }, fields:'userEnteredFormat.backgroundColor' } }
+  ] } });
 }
 
 
@@ -1202,18 +1224,27 @@ app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
 });
 
 // Sales approval for mechanic-added items: approved (light blue) / rejected (red).
+async function setRepairApproval(id, decision, username) {
+  await pgQuery(`UPDATE repair_items SET approval=$2 WHERE id=$1`, [id, decision]);
+  await audit2(username, decision === 'approved' ? 'approve' : 'reject', 'repair_item', String(id), null);
+  // Best-effort: colour the matching cell on the mechanic's sheet.
+  let sheetSynced = false;
+  try {
+    const it = (await pgQuery(`SELECT sheet_id, list_row FROM repair_items WHERE id=$1`, [id])).rows[0];
+    if (it && it.sheet_id && it.list_row) { await setApprovalColor(it.sheet_id, it.list_row, decision); sheetSynced = true; }
+  } catch(err) { console.warn('[approval] sheet colour failed:', err.message); }
+  return sheetSynced;
+}
 app.post('/repair-items/:id/approve', requireAuth, async (req, res) => {
   try {
-    await pgQuery(`UPDATE repair_items SET approval='approved' WHERE id=$1`, [req.params.id]);
-    await audit2(req.user.username, 'approve', 'repair_item', req.params.id, null);
-    res.json({ success:true });
+    const sheetSynced = await setRepairApproval(req.params.id, 'approved', req.user.username);
+    res.json({ success:true, sheetSynced });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to approve' }); }
 });
 app.post('/repair-items/:id/reject', requireAuth, async (req, res) => {
   try {
-    await pgQuery(`UPDATE repair_items SET approval='rejected' WHERE id=$1`, [req.params.id]);
-    await audit2(req.user.username, 'reject', 'repair_item', req.params.id, null);
-    res.json({ success:true });
+    const sheetSynced = await setRepairApproval(req.params.id, 'rejected', req.user.username);
+    res.json({ success:true, sheetSynced });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reject' }); }
 });
 
