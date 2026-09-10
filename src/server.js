@@ -118,6 +118,87 @@ function getDriveClient() {
   return google.drive({ version:'v3', auth });
 }
 
+// A LIST cell highlighted yellow by the mechanic means that item is done.
+// Detects true/near yellow while excluding white and pale green/blue.
+function isYellowish(c) {
+  if (!c) return false;
+  var r = c.red||0, g = c.green||0, b = c.blue||0;
+  return r >= 0.8 && g >= 0.7 && b <= 0.8 && Math.abs(r-g) <= 0.25 && (Math.min(r,g) - b) >= 0.12;
+}
+function workOrderFolderId() { return (process.env.WORK_ORDER_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,''); }
+function masterWorkorderId() { return (process.env.MASTER_WORKORDER_ID || '').trim().replace(/[.\/\s]+$/,''); }
+
+// Copy the master work-order Sheet into the shop folder, fill header + LIST, add ALL DONE checkbox.
+async function createWorkOrderSheet(o) {
+  const drive = getDriveClient();
+  const copy = await drive.files.copy({
+    fileId: o.masterId,
+    requestBody: { name: o.title, parents: [o.folderId] },
+    supportsAllDrives: true, fields: 'id, webViewLink'
+  });
+  const sheetId = copy.data.id;
+  const link = copy.data.webViewLink || ('https://docs.google.com/spreadsheets/d/' + sheetId);
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,title,index)' });
+  const first = (meta.data.sheets || []).slice().sort((a,b)=>(a.properties.index||0)-(b.properties.index||0))[0];
+  const tab = first ? first.properties.title : 'Sheet1';
+  const gridId = first ? first.properties.sheetId : 0;
+  const listStart = 16;
+  const data = [
+    { range:`${tab}!B2`, values:[[o.mechanic||'']] },
+    { range:`${tab}!C2`, values:[[o.date||'']] },
+    { range:`${tab}!D2`, values:[[o.company||'']] },
+    { range:`${tab}!B4`, values:[[o.vin||'']] },
+    { range:`${tab}!C4`, values:[[o.unit||'']] },
+    { range:`${tab}!D4`, values:[[o.miles||'']] },
+    { range:`${tab}!L15`, values:[['ALL DONE:']] }
+  ];
+  if (o.items && o.items.length) data.push({ range:`${tab}!K${listStart}:K${listStart + o.items.length - 1}`, values:o.items.map(t=>[t]) });
+  await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody:{ valueInputOption:'USER_ENTERED', data } });
+  // ALL DONE checkbox at M15
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
+    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:12, endColumnIndex:13 },
+      cell:{ dataValidation:{ condition:{ type:'BOOLEAN' } }, userEnteredValue:{ boolValue:false } },
+      fields:'dataValidation,userEnteredValue' } }
+  ] } });
+  return { sheetId, link, listStart, tab };
+}
+
+// Read the mechanic's sheet: LIST rows (text + yellow flag) and the ALL DONE checkbox.
+async function readWorkOrderSheet(sheetId, tab, listStart) {
+  const sheets = getSheetsClient();
+  tab = tab || 'Sheet1'; listStart = listStart || 16;
+  const endRow = listStart + 100;
+  const resp = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!M15`],
+    includeGridData: true,
+    fields: 'sheets(data(rowData(values(formattedValue,effectiveValue,effectiveFormat/backgroundColor))))'
+  });
+  const grids = (resp.data.sheets && resp.data.sheets[0] && resp.data.sheets[0].data) || [];
+  const listGrid = grids[0] || {};
+  const doneGrid = grids[1] || {};
+  const rows = [];
+  const rowData = listGrid.rowData || [];
+  for (let i = 0; i < rowData.length; i++) {
+    const cell = (rowData[i].values && rowData[i].values[0]) || {};
+    const text = (cell.formattedValue || '').trim();
+    const yellow = isYellowish(cell.effectiveFormat && cell.effectiveFormat.backgroundColor);
+    rows.push({ row: listStart + i, text, yellow });
+  }
+  let allDone = false;
+  try {
+    const dc = doneGrid.rowData && doneGrid.rowData[0] && doneGrid.rowData[0].values && doneGrid.rowData[0].values[0];
+    if (dc) {
+      if (dc.effectiveValue && dc.effectiveValue.boolValue === true) allDone = true;
+      const fv = (dc.formattedValue || '').trim().toLowerCase();
+      if (['true','yes','done','all done','complete'].includes(fv)) allDone = true;
+    }
+  } catch(e) {}
+  return { rows, allDone };
+}
+
+
 // ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
 // ── ROLE PERMISSIONS ──────────────────────────────────────────────────────────
 // Add roles or features here. A role listed for a feature is allowed.
@@ -1345,30 +1426,46 @@ app.post('/work-orders', requireAuth, async (req, res) => {
       ${d.notes ? `<h3 style="margin-bottom:4px;margin-top:16px;">Notes</h3><div style="font-size:14px;white-space:pre-wrap;">${esc(d.notes)}</div>` : ''}
       </body></html>`;
 
-    const drive = getDriveClient();
     const title = `Work Order — Unit ${d.unit||'?'} — ${date}`;
-    const created = await drive.files.create({
-      requestBody: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] },
-      media: { mimeType: 'text/html', body: html },
-      fields: 'id, webViewLink',
-      supportsAllDrives: true,
-    });
-    const link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
-
-    // Record each issue in repair_items so it appears in the Repairs panel for sales to verify.
     const woKey = 'WO' + Date.now();
+    const masterId = masterWorkorderId();
+    let link, sheetId = '', listStart = 16, tab = 'Sheet1', mode = 'doc';
+
+    if (masterId) {
+      // Preferred: copy the master template Sheet and fill it in.
+      const made = await createWorkOrderSheet({
+        masterId, folderId, title,
+        mechanic: inspectedBy, date, company: d.company || 'Direct Truck Sales Inc.',
+        vin: d.vin || '', unit: d.unit || '', miles: d.miles || '', items
+      });
+      link = made.link; sheetId = made.sheetId; listStart = made.listStart; tab = made.tab; mode = 'sheet';
+      await pgQuery(`INSERT INTO work_orders (wo_key, unit, vehicle_desc, vin, miles, mechanic, company, priority, sheet_id, sheet_link, list_start_row, status, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'Open',$12)`,
+        [woKey, d.unit||'', d.vehicleDesc||'', d.vin||'', d.miles||'', inspectedBy, d.company||'', priority, sheetId, link, listStart, req.user.username]);
+    } else {
+      // Fallback (no master configured yet): the original Google Doc.
+      const drive = getDriveClient();
+      const created = await drive.files.create({
+        requestBody: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] },
+        media: { mimeType: 'text/html', body: html },
+        fields: 'id, webViewLink', supportsAllDrives: true,
+      });
+      link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
+    }
+
+    // Record each issue in repair_items so it appears in the Repairs panel.
     try {
       for (let s = 0; s < items.length; s++) {
         await pgQuery(`
-          INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by)
-          VALUES ($1,$2,$3,$4,$5,'pending','work_order',$6,$7,$8)
+          INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id)
+          VALUES ($1,$2,$3,$4,$5,'pending','work_order',$6,$7,$8,$9,$10)
           ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
-          [woKey, d.unit||'', d.vehicleDesc||'', s+1, items[s], link, priority, inspectedBy]);
+          [woKey, d.unit||'', d.vehicleDesc||'', s+1, items[s], link, priority, inspectedBy, listStart + s, sheetId]);
       }
     } catch(recErr) { console.warn('[work-order] repair_items record failed:', recErr.message); }
 
-    await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority });
-    res.json({ success:true, docId: created.data.id, link, tracked: items.length });
+    await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority, mode });
+    res.json({ success:true, docId: sheetId || undefined, link, tracked: items.length, mode });
   } catch(e) {
     console.error('work order error', e);
     const msg = (e && e.message) ? e.message : 'unknown error';
@@ -1454,6 +1551,95 @@ app.post('/sourcing/units', requireAuth, requireSourcing, async (req, res) => {
 app.delete('/sourcing/units/:id', requireAuth, requireSourcing, async (req, res) => {
   try { await pgQuery('DELETE FROM sourcing_units WHERE id=$1', [req.params.id]); res.json({ success:true }); }
   catch(e) { res.status(500).json({ error:'Failed to delete unit' }); }
+});
+
+// ── WORK ORDER LIST + SYNC ────────────────────────────────────────────────────
+// List work orders (for the Repairs tab sync button).
+app.get('/work-orders', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`
+      SELECT w.*,
+        (SELECT count(*) FROM repair_items r WHERE r.bos_id = w.wo_key) AS item_count,
+        (SELECT count(*) FROM repair_items r WHERE r.bos_id = w.wo_key AND r.status='done') AS done_count
+      FROM work_orders w ORDER BY w.created_at DESC`);
+    res.json(rows.map(w => ({
+      id:w.id, unit:w.unit, vehicleDesc:w.vehicle_desc, mechanic:w.mechanic,
+      sheetLink:w.sheet_link, sheetId:w.sheet_id, status:w.status,
+      itemCount:Number(w.item_count)||0, doneCount:Number(w.done_count)||0, createdAt:w.created_at
+    })));
+  } catch(e) { console.error('list work orders', e); res.status(500).json({ error:'Failed to list work orders' }); }
+});
+
+// Sync one work order's mechanic sheet back into Repairs.
+async function syncOneWorkOrder(wo, username) {
+  if (!wo.sheet_id) return { updated:0, added:0, skipped:'no sheet' };
+  const { rows, allDone } = await readWorkOrderSheet(wo.sheet_id, null, wo.list_start_row || 16);
+  const existing = (await pgQuery(`SELECT * FROM repair_items WHERE bos_id=$1 ORDER BY item_slot`, [wo.wo_key])).rows;
+  const byRow = {}; let maxSlot = 0;
+  for (const it of existing) { if (it.list_row) byRow[it.list_row] = it; if (it.item_slot > maxSlot) maxSlot = it.item_slot; }
+  let updated = 0, added = 0;
+  for (const r of rows) {
+    if (!r.text) continue;
+    const doneNow = r.yellow || allDone;
+    const item = byRow[r.row];
+    if (item) {
+      const newStatus = doneNow ? 'done' : 'pending';
+      const descChanged = (item.description || '') !== r.text;
+      if (item.status !== newStatus || descChanged) {
+        if (newStatus === 'done') {
+          await pgQuery(`UPDATE repair_items SET description=$2, status='done',
+             completed_by=CASE WHEN status='done' THEN completed_by ELSE $3 END,
+             completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END WHERE id=$1`,
+            [item.id, r.text, 'mechanic (sheet)']);
+        } else {
+          await pgQuery(`UPDATE repair_items SET description=$2, status='pending', completed_by='', completed_at=NULL WHERE id=$1`,
+            [item.id, r.text]);
+        }
+        updated++;
+      }
+    } else {
+      maxSlot++;
+      await pgQuery(`INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id, completed_by, completed_at)
+        VALUES ($1,$2,$3,$4,$5,$6,'work_order',$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
+        [wo.wo_key, wo.unit||'', wo.vehicle_desc||'', maxSlot, r.text, doneNow?'done':'pending',
+         wo.sheet_link||'', wo.priority||'', 'mechanic (sheet)', r.row, wo.sheet_id,
+         doneNow?'mechanic (sheet)':'', doneNow?new Date():null]);
+      added++;
+    }
+  }
+  if (allDone) {
+    await pgQuery(`UPDATE repair_items SET status='done',
+        completed_by=CASE WHEN status='done' THEN completed_by ELSE 'mechanic (sheet)' END,
+        completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END
+      WHERE bos_id=$1 AND status<>'done'`, [wo.wo_key]);
+    await pgQuery(`UPDATE work_orders SET status='Complete' WHERE id=$1`, [wo.id]);
+  } else {
+    await pgQuery(`UPDATE work_orders SET status='Open' WHERE id=$1`, [wo.id]);
+  }
+  return { updated, added, allDone };
+}
+
+app.post('/work-orders/:id/sync', requireAuth, async (req, res) => {
+  try {
+    const wo = (await pgQuery(`SELECT * FROM work_orders WHERE id=$1`, [req.params.id])).rows[0];
+    if (!wo) return res.status(404).json({ error:'Work order not found' });
+    const r = await syncOneWorkOrder(wo, req.user.username);
+    res.json({ success:true, ...r });
+  } catch(e) { console.error('wo sync', e); res.status(500).json({ error:'Sync failed: ' + (e.message||e) }); }
+});
+
+// Sync every open work order at once (button in the Repairs tab).
+app.post('/work-orders/sync-all', requireAuth, async (req, res) => {
+  try {
+    const wos = (await pgQuery(`SELECT * FROM work_orders WHERE sheet_id <> '' ORDER BY created_at DESC`)).rows;
+    let updated = 0, added = 0, synced = 0, completed = 0;
+    for (const wo of wos) {
+      try { const r = await syncOneWorkOrder(wo, req.user.username); updated += r.updated||0; added += r.added||0; synced++; if (r.allDone) completed++; }
+      catch(err) { console.warn('sync-all one failed', wo.id, err.message); }
+    }
+    res.json({ success:true, synced, updated, added, completed });
+  } catch(e) { console.error('wo sync-all', e); res.status(500).json({ error:'Sync failed' }); }
 });
 
 // Call log — one row per touchpoint. Logging a call can advance the follow-up date
