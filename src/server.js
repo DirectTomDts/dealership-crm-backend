@@ -151,14 +151,13 @@ async function createWorkOrderSheet(o) {
     { range:`${tab}!B4`, values:[[o.vin||'']] },
     { range:`${tab}!C4`, values:[[o.unit||'']] },
     { range:`${tab}!D4`, values:[[o.miles||'']] },
-    { range:`${tab}!L15`, values:[['APPROVED']] },
-    { range:`${tab}!N15`, values:[['ALL DONE:']] }
+    { range:`${tab}!L15`, values:[['ALL DONE:']] }
   ];
   if (o.items && o.items.length) data.push({ range:`${tab}!K${listStart}:K${listStart + o.items.length - 1}`, values:o.items.map(t=>[t]) });
   await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody:{ valueInputOption:'USER_ENTERED', data } });
-  // ALL DONE checkbox at O15 (col index 14)
+  // ALL DONE checkbox at M15 (col index 12)
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
-    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:14, endColumnIndex:15 },
+    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:12, endColumnIndex:13 },
       cell:{ dataValidation:{ condition:{ type:'BOOLEAN' } }, userEnteredValue:{ boolValue:false } },
       fields:'dataValidation,userEnteredValue' } }
   ] } });
@@ -172,13 +171,13 @@ async function readWorkOrderSheet(sheetId, tab, listStart) {
   const endRow = listStart + 100;
   const resp = await sheets.spreadsheets.get({
     spreadsheetId: sheetId,
-    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!O15`, `${tab}!M15`],
+    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!M15`, `${tab}!O15`],
     includeGridData: true,
     fields: 'sheets(data(rowData(values(formattedValue,effectiveValue,effectiveFormat/backgroundColor))))'
   });
   const grids = (resp.data.sheets && resp.data.sheets[0] && resp.data.sheets[0].data) || [];
   const listGrid = grids[0] || {};
-  const doneGrids = [grids[1], grids[2]];   // O15 (current) and M15 (older sheets)
+  const doneGrids = [grids[1], grids[2]];   // M15 (current) and O15 (older sheets)
   const rows = [];
   const rowData = listGrid.rowData || [];
   for (let i = 0; i < rowData.length; i++) {
@@ -201,22 +200,26 @@ async function readWorkOrderSheet(sheetId, tab, listStart) {
   return { rows, allDone };
 }
 
-// Reflect a sales approval decision on the mechanic's sheet: colour the APPROVED cell
-// (column L) next to the item — light blue = approved, red = not approved, clear = undecided.
+// Reflect a sales approval decision on the mechanic's sheet: colour the LIST item cell
+// (column K) — light blue = approved, red = not approved, clear = undecided.
 async function setApprovalColor(sheetId, listRow, decision) {
-  if (!sheetId || !listRow) return;
+  if (!sheetId || !listRow) throw new Error('missing sheet_id or list_row');
   const sheets = getSheetsClient();
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,index)' });
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,index,title)' });
   const first = (meta.data.sheets || []).slice().sort((a,b)=>(a.properties.index||0)-(b.properties.index||0))[0];
-  const gridId = first ? first.properties.sheetId : 0;
+  if (!first) throw new Error('spreadsheet has no sheets');
+  const gridId = first.properties.sheetId;
   let color;
   if (decision === 'approved')      color = { red:0.624, green:0.773, blue:0.910 }; // #9FC5E8 light blue
   else if (decision === 'rejected') color = { red:0.878, green:0.400, blue:0.400 }; // #E06666 red
   else                              color = { red:1, green:1, blue:1 };             // clear
-  const rowIdx = listRow - 1, col = 11; // column L
+  const rowIdx = listRow - 1, col = 10; // column K (the LIST item)
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
-    { repeatCell: { range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:col, endColumnIndex:col+1 },
-      cell:{ userEnteredFormat:{ backgroundColor: color } }, fields:'userEnteredFormat.backgroundColor' } }
+    { repeatCell: {
+        range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:col, endColumnIndex:col+1 },
+        cell:{ userEnteredFormat:{ backgroundColor: color, backgroundColorStyle:{ rgbColor: color } } },
+        fields:'userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle'
+    } }
   ] } });
 }
 
@@ -1227,24 +1230,30 @@ app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
 async function setRepairApproval(id, decision, username) {
   await pgQuery(`UPDATE repair_items SET approval=$2 WHERE id=$1`, [id, decision]);
   await audit2(username, decision === 'approved' ? 'approve' : 'reject', 'repair_item', String(id), null);
-  // Best-effort: colour the matching cell on the mechanic's sheet.
-  let sheetSynced = false;
+  // Colour the matching cell on the mechanic's sheet; report exactly what happened.
+  const it = (await pgQuery(`SELECT sheet_id, list_row, source FROM repair_items WHERE id=$1`, [id])).rows[0];
+  if (!it) return { sheetSynced:false, sheetError:'item not found' };
+  if (!it.sheet_id || !it.list_row) {
+    return { sheetSynced:false, sheetError:'This item is not linked to a work-order sheet (no sheet_id/list_row) — it can only be coloured if it came from a sheet-based work order.' };
+  }
   try {
-    const it = (await pgQuery(`SELECT sheet_id, list_row FROM repair_items WHERE id=$1`, [id])).rows[0];
-    if (it && it.sheet_id && it.list_row) { await setApprovalColor(it.sheet_id, it.list_row, decision); sheetSynced = true; }
-  } catch(err) { console.warn('[approval] sheet colour failed:', err.message); }
-  return sheetSynced;
+    await setApprovalColor(it.sheet_id, it.list_row, decision);
+    return { sheetSynced:true };
+  } catch(err) {
+    console.error('[approval] sheet colour failed:', err && err.message, err && err.errors);
+    return { sheetSynced:false, sheetError:(err && err.message) || 'sheet update failed' };
+  }
 }
 app.post('/repair-items/:id/approve', requireAuth, async (req, res) => {
   try {
-    const sheetSynced = await setRepairApproval(req.params.id, 'approved', req.user.username);
-    res.json({ success:true, sheetSynced });
+    const r = await setRepairApproval(req.params.id, 'approved', req.user.username);
+    res.json({ success:true, ...r });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to approve' }); }
 });
 app.post('/repair-items/:id/reject', requireAuth, async (req, res) => {
   try {
-    const sheetSynced = await setRepairApproval(req.params.id, 'rejected', req.user.username);
-    res.json({ success:true, sheetSynced });
+    const r = await setRepairApproval(req.params.id, 'rejected', req.user.username);
+    res.json({ success:true, ...r });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reject' }); }
 });
 
@@ -1598,6 +1607,32 @@ app.post('/sourcing/units', requireAuth, requireSourcing, async (req, res) => {
 app.delete('/sourcing/units/:id', requireAuth, requireSourcing, async (req, res) => {
   try { await pgQuery('DELETE FROM sourcing_units WHERE id=$1', [req.params.id]); res.json({ success:true }); }
   catch(e) { res.status(500).json({ error:'Failed to delete unit' }); }
+});
+
+// Diagnostic for approval → sheet colouring (admins).
+app.get('/debug/approval', requireAuth, requireAdmin, async (req, res) => {
+  const out = { credsSet: !!process.env.GOOGLE_CREDENTIALS };
+  try {
+    const items = (await pgQuery(`SELECT id, description, approval, source, sheet_id, list_row
+      FROM repair_items WHERE approval <> '' ORDER BY id DESC LIMIT 25`)).rows;
+    out.approvalItems = items.map(i => ({ id:i.id, desc:i.description, approval:i.approval,
+      source:i.source, hasSheet: !!i.sheet_id, sheetId: i.sheet_id ? (i.sheet_id.slice(0,8)+'…') : null, listRow:i.list_row }));
+    out.count = items.length;
+    // Optional live test: /debug/approval?test=<itemId>
+    if (req.query.test) {
+      const it = items.find(x => String(x.id) === String(req.query.test)) ||
+                 (await pgQuery(`SELECT * FROM repair_items WHERE id=$1`, [req.query.test])).rows[0];
+      if (!it) out.test = { ok:false, reason:'item not found' };
+      else if (!it.sheet_id || !it.list_row) out.test = { ok:false, reason:'no sheet_id/list_row on this item' };
+      else {
+        try { await setApprovalColor(it.sheet_id, it.list_row, it.approval || 'approved');
+          out.test = { ok:true, colored:`sheet ${it.sheet_id.slice(0,8)}… row ${it.list_row} col K` }; }
+        catch(e) { out.test = { ok:false, reason:(e && e.message) || String(e), errors: e && e.errors }; }
+      }
+    }
+    out.result = 'OK';
+  } catch(e) { out.result = 'Error: ' + ((e && e.message) || e); }
+  res.json(out);
 });
 
 // ── WORK ORDER LIST + SYNC ────────────────────────────────────────────────────
