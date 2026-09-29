@@ -213,12 +213,20 @@ async function setApprovalColor(sheetId, listRow, decision) {
   if (decision === 'approved')      color = { red:0.624, green:0.773, blue:0.910 }; // #9FC5E8 light blue
   else if (decision === 'rejected') color = { red:0.878, green:0.400, blue:0.400 }; // #E06666 red
   else                              color = { red:1, green:1, blue:1 };             // clear
-  const rowIdx = listRow - 1, col = 10; // column K (the LIST item)
+  const rowIdx = listRow - 1, col = 10; // column K = the LIST item cell itself
+  const white = { red:1, green:1, blue:1 };
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
+    // Colour the item in column K (single valid colour field — never both).
     { repeatCell: {
         range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:col, endColumnIndex:col+1 },
-        cell:{ userEnteredFormat:{ backgroundColor: color, backgroundColorStyle:{ rgbColor: color } } },
-        fields:'userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle'
+        cell:{ userEnteredFormat:{ backgroundColor: color } },
+        fields:'userEnteredFormat.backgroundColor'
+    } },
+    // Clear the old column-L cell in case an earlier build coloured it there.
+    { repeatCell: {
+        range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:11, endColumnIndex:12 },
+        cell:{ userEnteredFormat:{ backgroundColor: white } },
+        fields:'userEnteredFormat.backgroundColor'
     } }
   ] } });
 }
@@ -267,6 +275,13 @@ function requireFeature(feature) {
   };
 }
 
+// Tom-only: private pipeline of units being worked (price + source are confidential).
+function isPipelineUser(user) { return !!user && String(user.username||'').toLowerCase() === 'tom'; }
+function requirePipeline(req, res, next) {
+  if (!req.user) return res.status(401).json({ error:'Not authenticated' });
+  if (!isPipelineUser(req.user)) return res.status(403).json({ error:'Not available' });
+  next();
+}
 async function requireSourcing(req, res, next) {
   if (!req.user) return res.status(401).json({ error:'Not authenticated' });
   try {
@@ -468,6 +483,10 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
+// Public build check: open <server-url>/version in a browser to confirm what's deployed.
+const SERVER_BUILD = '2026-09-29-pipeline-arrived';
+app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
+
 app.get('/me', requireAuth, async (req, res) => {
   let sourcing = (req.user.username === 'tom');
   try {
@@ -828,12 +847,26 @@ function canManageUpcoming(role) { return role === 'office' || role === 'admin';
 app.get('/upcoming', requireAuth, async (req, res) => {
   try {
     const { rows } = await pgQuery('SELECT * FROM upcoming_units ORDER BY expected_date ASC NULLS LAST, created_at DESC');
-    res.json(rows.map(r => ({
+    const manual = rows.map(r => ({
       id:r.id, year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'', hours:r.hours||'',
       apu:r.apu||'', color:r.color||'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
       expectedDate:r.expected_date||'', expectedPrice:r.expected_price||'', notes:r.notes||'',
       createdBy:r.created_by||'',
-    })));
+    }));
+    // Purchased units from the sourcing pipeline. Whitelisted fields only — price, fleet/broker
+    // name/contact/phone and private notes are deliberately never selected or sent.
+    let purchased = [];
+    try {
+      const p = await pgQuery(`SELECT id, year, make, model, miles, ratio, apu, hp, transmission, warranty, vin, fob, expected_date
+        FROM sourcing_pipeline WHERE status='Purchased' ORDER BY expected_date ASC NULLS LAST, purchased_at DESC`);
+      purchased = p.rows.map(r => ({
+        id:'P'+r.id, source:'pipeline', year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'',
+        hours:'', apu:r.apu||'', color:'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
+        transmission:r.transmission||'', warranty:r.warranty||'', fob:r.fob||'',
+        expectedDate:r.expected_date||'', expectedPrice:'', notes:'', createdBy:''
+      }));
+    } catch(pe) { /* table not migrated yet — just show manual upcoming units */ }
+    res.json(manual.concat(purchased));
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load upcoming units' }); }
 });
 
@@ -1722,6 +1755,73 @@ app.post('/work-orders/sync-all', requireAuth, async (req, res) => {
     }
     res.json({ success:true, synced, updated, added, completed });
   } catch(e) { console.error('wo sync-all', e); res.status(500).json({ error:'Sync failed' }); }
+});
+
+// ── SOURCING PIPELINE (Tom only) ─────────────────────────────────────────────
+const PIPELINE_STATUSES = ['Incoming','Pending inspection','Purchased','Arrived'];
+const PIPELINE_FIELDS = ['year','make','model','miles','ratio','apu','hp','transmission','warranty','vin','fob',
+  'price','status','source_type','source_name','source_contact','source_phone','expected_date','notes'];
+function pipelineRow(r) {
+  return { id:r.id, year:r.year, make:r.make, model:r.model, miles:r.miles, ratio:r.ratio, apu:r.apu, hp:r.hp,
+    transmission:r.transmission, warranty:r.warranty, vin:r.vin, fob:r.fob, price:r.price, status:r.status,
+    sourceType:r.source_type, sourceName:r.source_name, sourceContact:r.source_contact, sourcePhone:r.source_phone,
+    expectedDate:r.expected_date, notes:r.notes, purchasedAt:r.purchased_at, arrivedAt:r.arrived_at, createdAt:r.created_at, updatedAt:r.updated_at };
+}
+app.get('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`SELECT * FROM sourcing_pipeline ORDER BY
+      CASE status WHEN 'Incoming' THEN 1 WHEN 'Pending inspection' THEN 2 WHEN 'Purchased' THEN 3 ELSE 4 END, updated_at DESC`);
+    res.json(rows.map(pipelineRow));
+  } catch(e) { console.error('pipeline list', e); res.status(500).json({ error:'Failed to load pipeline' }); }
+});
+app.post('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    const v = {
+      year:d.year, make:d.make, model:d.model, miles:d.miles, ratio:d.ratio, apu:d.apu, hp:d.hp,
+      transmission:d.transmission, warranty:d.warranty, vin:d.vin, fob:d.fob, price:d.price,
+      status: PIPELINE_STATUSES.includes(d.status) ? d.status : 'Incoming',
+      source_type: d.sourceType === 'Broker' ? 'Broker' : 'Fleet',
+      source_name:d.sourceName, source_contact:d.sourceContact, source_phone:d.sourcePhone,
+      expected_date:d.expectedDate, notes:d.notes
+    };
+    const vals = PIPELINE_FIELDS.map(k => v[k] == null ? '' : String(v[k]));
+    if (d.id) {
+      const sets = PIPELINE_FIELDS.map((k,i) => `${k}=$${i+2}`).join(', ');
+      await pgQuery(`UPDATE sourcing_pipeline SET ${sets}, updated_at=now(),
+        purchased_at = CASE WHEN $${PIPELINE_FIELDS.indexOf('status')+2} IN ('Purchased','Arrived') THEN COALESCE(purchased_at, now()) ELSE NULL END,
+        arrived_at   = CASE WHEN $${PIPELINE_FIELDS.indexOf('status')+2}='Arrived' THEN COALESCE(arrived_at, now()) ELSE NULL END
+        WHERE id=$1`, [d.id, ...vals]);
+      await audit2(req.user.username, 'update', 'sourcing_pipeline', String(d.id), { status:v.status });
+      return res.json({ success:true, id:d.id });
+    }
+    const cols = PIPELINE_FIELDS.join(',');
+    const ph = PIPELINE_FIELDS.map((_,i) => `$${i+1}`).join(',');
+    const r = await pgQuery(`INSERT INTO sourcing_pipeline (${cols}, created_by, purchased_at, arrived_at)
+      VALUES (${ph}, $${PIPELINE_FIELDS.length+1}, ${(v.status==='Purchased'||v.status==='Arrived') ? 'now()' : 'NULL'}, ${v.status==='Arrived' ? 'now()' : 'NULL'}) RETURNING id`,
+      [...vals, req.user.username]);
+    await audit2(req.user.username, 'create', 'sourcing_pipeline', String(r.rows[0].id), { status:v.status });
+    res.json({ success:true, id:r.rows[0].id });
+  } catch(e) { console.error('pipeline save', e); res.status(500).json({ error:'Failed to save unit' }); }
+});
+app.post('/sourcing/pipeline/:id/status', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const status = String((req.body||{}).status||'');
+    if (!PIPELINE_STATUSES.includes(status)) return res.status(400).json({ error:'Invalid status' });
+    await pgQuery(`UPDATE sourcing_pipeline SET status=$2, updated_at=now(),
+      purchased_at = CASE WHEN $2 IN ('Purchased','Arrived') THEN COALESCE(purchased_at, now()) ELSE NULL END,
+      arrived_at   = CASE WHEN $2='Arrived' THEN COALESCE(arrived_at, now()) ELSE NULL END WHERE id=$1`,
+      [req.params.id, status]);
+    await audit2(req.user.username, 'status', 'sourcing_pipeline', req.params.id, { status });
+    res.json({ success:true });
+  } catch(e) { console.error('pipeline status', e); res.status(500).json({ error:'Failed to update status' }); }
+});
+app.delete('/sourcing/pipeline/:id', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    await pgQuery('DELETE FROM sourcing_pipeline WHERE id=$1', [req.params.id]);
+    await audit2(req.user.username, 'delete', 'sourcing_pipeline', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ error:'Failed to delete' }); }
 });
 
 // Call log — one row per touchpoint. Logging a call can advance the follow-up date
