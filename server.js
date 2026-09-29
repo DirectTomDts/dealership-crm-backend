@@ -118,6 +118,120 @@ function getDriveClient() {
   return google.drive({ version:'v3', auth });
 }
 
+// A LIST cell highlighted yellow by the mechanic means that item is done.
+// Detects true/near yellow while excluding white and pale green/blue.
+function isYellowish(c) {
+  if (!c) return false;
+  var r = c.red||0, g = c.green||0, b = c.blue||0;
+  return r >= 0.8 && g >= 0.7 && b <= 0.8 && Math.abs(r-g) <= 0.25 && (Math.min(r,g) - b) >= 0.12;
+}
+function workOrderFolderId() { return (process.env.WORK_ORDER_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,''); }
+function masterWorkorderId() { return (process.env.MASTER_WORKORDER_ID || '').trim().replace(/[.\/\s]+$/,''); }
+
+// Copy the master work-order Sheet into the shop folder, fill header + LIST, add ALL DONE checkbox.
+async function createWorkOrderSheet(o) {
+  const drive = getDriveClient();
+  const copy = await drive.files.copy({
+    fileId: o.masterId,
+    requestBody: { name: o.title, parents: [o.folderId] },
+    supportsAllDrives: true, fields: 'id, webViewLink'
+  });
+  const sheetId = copy.data.id;
+  const link = copy.data.webViewLink || ('https://docs.google.com/spreadsheets/d/' + sheetId);
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,title,index)' });
+  const first = (meta.data.sheets || []).slice().sort((a,b)=>(a.properties.index||0)-(b.properties.index||0))[0];
+  const tab = first ? first.properties.title : 'Sheet1';
+  const gridId = first ? first.properties.sheetId : 0;
+  const listStart = 16;
+  const data = [
+    { range:`${tab}!B2`, values:[[o.mechanic||'']] },
+    { range:`${tab}!C2`, values:[[o.date||'']] },
+    { range:`${tab}!D2`, values:[[o.company||'']] },
+    { range:`${tab}!B4`, values:[[o.vin||'']] },
+    { range:`${tab}!C4`, values:[[o.unit||'']] },
+    { range:`${tab}!D4`, values:[[o.miles||'']] },
+    { range:`${tab}!L15`, values:[['ALL DONE:']] }
+  ];
+  if (o.items && o.items.length) data.push({ range:`${tab}!K${listStart}:K${listStart + o.items.length - 1}`, values:o.items.map(t=>[t]) });
+  await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody:{ valueInputOption:'USER_ENTERED', data } });
+  // ALL DONE checkbox at M15 (col index 12)
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
+    { repeatCell: { range:{ sheetId:gridId, startRowIndex:14, endRowIndex:15, startColumnIndex:12, endColumnIndex:13 },
+      cell:{ dataValidation:{ condition:{ type:'BOOLEAN' } }, userEnteredValue:{ boolValue:false } },
+      fields:'dataValidation,userEnteredValue' } }
+  ] } });
+  return { sheetId, link, listStart, tab };
+}
+
+// Read the mechanic's sheet: LIST rows (text + yellow flag) and the ALL DONE checkbox.
+async function readWorkOrderSheet(sheetId, tab, listStart) {
+  const sheets = getSheetsClient();
+  tab = tab || 'Sheet1'; listStart = listStart || 16;
+  const endRow = listStart + 100;
+  const resp = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    ranges: [`${tab}!K${listStart}:K${endRow}`, `${tab}!M15`, `${tab}!O15`],
+    includeGridData: true,
+    fields: 'sheets(data(rowData(values(formattedValue,effectiveValue,effectiveFormat/backgroundColor))))'
+  });
+  const grids = (resp.data.sheets && resp.data.sheets[0] && resp.data.sheets[0].data) || [];
+  const listGrid = grids[0] || {};
+  const doneGrids = [grids[1], grids[2]];   // M15 (current) and O15 (older sheets)
+  const rows = [];
+  const rowData = listGrid.rowData || [];
+  for (let i = 0; i < rowData.length; i++) {
+    const cell = (rowData[i].values && rowData[i].values[0]) || {};
+    const text = (cell.formattedValue || '').trim();
+    const yellow = isYellowish(cell.effectiveFormat && cell.effectiveFormat.backgroundColor);
+    rows.push({ row: listStart + i, text, yellow });
+  }
+  let allDone = false;
+  for (const g of doneGrids) {
+    try {
+      const dc = g && g.rowData && g.rowData[0] && g.rowData[0].values && g.rowData[0].values[0];
+      if (dc) {
+        if (dc.effectiveValue && dc.effectiveValue.boolValue === true) allDone = true;
+        const fv = (dc.formattedValue || '').trim().toLowerCase();
+        if (['true','yes','done','all done','complete'].includes(fv)) allDone = true;
+      }
+    } catch(e) {}
+  }
+  return { rows, allDone };
+}
+
+// Reflect a sales approval decision on the mechanic's sheet: colour the LIST item cell
+// (column K) — light blue = approved, red = not approved, clear = undecided.
+async function setApprovalColor(sheetId, listRow, decision) {
+  if (!sheetId || !listRow) throw new Error('missing sheet_id or list_row');
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields:'sheets.properties(sheetId,index,title)' });
+  const first = (meta.data.sheets || []).slice().sort((a,b)=>(a.properties.index||0)-(b.properties.index||0))[0];
+  if (!first) throw new Error('spreadsheet has no sheets');
+  const gridId = first.properties.sheetId;
+  let color;
+  if (decision === 'approved')      color = { red:0.624, green:0.773, blue:0.910 }; // #9FC5E8 light blue
+  else if (decision === 'rejected') color = { red:0.878, green:0.400, blue:0.400 }; // #E06666 red
+  else                              color = { red:1, green:1, blue:1 };             // clear
+  const rowIdx = listRow - 1, col = 10; // column K = the LIST item cell itself
+  const white = { red:1, green:1, blue:1 };
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody:{ requests:[
+    // Colour the item in column K (single valid colour field — never both).
+    { repeatCell: {
+        range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:col, endColumnIndex:col+1 },
+        cell:{ userEnteredFormat:{ backgroundColor: color } },
+        fields:'userEnteredFormat.backgroundColor'
+    } },
+    // Clear the old column-L cell in case an earlier build coloured it there.
+    { repeatCell: {
+        range:{ sheetId:gridId, startRowIndex:rowIdx, endRowIndex:rowIdx+1, startColumnIndex:11, endColumnIndex:12 },
+        cell:{ userEnteredFormat:{ backgroundColor: white } },
+        fields:'userEnteredFormat.backgroundColor'
+    } }
+  ] } });
+}
+
+
 // ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
 // ── ROLE PERMISSIONS ──────────────────────────────────────────────────────────
 // Add roles or features here. A role listed for a feature is allowed.
@@ -161,6 +275,13 @@ function requireFeature(feature) {
   };
 }
 
+// Tom-only: private pipeline of units being worked (price + source are confidential).
+function isPipelineUser(user) { return !!user && String(user.username||'').toLowerCase() === 'tom'; }
+function requirePipeline(req, res, next) {
+  if (!req.user) return res.status(401).json({ error:'Not authenticated' });
+  if (!isPipelineUser(req.user)) return res.status(403).json({ error:'Not available' });
+  next();
+}
 async function requireSourcing(req, res, next) {
   if (!req.user) return res.status(401).json({ error:'Not authenticated' });
   try {
@@ -722,12 +843,26 @@ function canManageUpcoming(role) { return role === 'office' || role === 'admin';
 app.get('/upcoming', requireAuth, async (req, res) => {
   try {
     const { rows } = await pgQuery('SELECT * FROM upcoming_units ORDER BY expected_date ASC NULLS LAST, created_at DESC');
-    res.json(rows.map(r => ({
+    const manual = rows.map(r => ({
       id:r.id, year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'', hours:r.hours||'',
       apu:r.apu||'', color:r.color||'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
       expectedDate:r.expected_date||'', expectedPrice:r.expected_price||'', notes:r.notes||'',
       createdBy:r.created_by||'',
-    })));
+    }));
+    // Purchased units from the sourcing pipeline. Whitelisted fields only — price, fleet/broker
+    // name/contact/phone and private notes are deliberately never selected or sent.
+    let purchased = [];
+    try {
+      const p = await pgQuery(`SELECT id, year, make, model, miles, ratio, apu, hp, transmission, warranty, vin, fob, expected_date
+        FROM sourcing_pipeline WHERE status='Purchased' ORDER BY expected_date ASC NULLS LAST, purchased_at DESC`);
+      purchased = p.rows.map(r => ({
+        id:'P'+r.id, source:'pipeline', year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'',
+        hours:'', apu:r.apu||'', color:'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
+        transmission:r.transmission||'', warranty:r.warranty||'', fob:r.fob||'',
+        expectedDate:r.expected_date||'', expectedPrice:'', notes:'', createdBy:''
+      }));
+    } catch(pe) { /* table not migrated yet — just show manual upcoming units */ }
+    res.json(manual.concat(purchased));
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load upcoming units' }); }
 });
 
@@ -1087,7 +1222,7 @@ app.get('/repair-items', requireAuth, async (req, res) => {
     for (const r of rows) {
       const o = { id:r.id, bosId:r.bos_id, unit:r.unit, vehicleDesc:r.vehicle_desc,
         slot:r.item_slot, description:r.description, status:r.status,
-        source:r.source||'bos', docLink:r.doc_link||'', priority:r.priority||'', createdBy:r.created_by||'',
+        source:r.source||'bos', docLink:r.doc_link||'', priority:r.priority||'', createdBy:r.created_by||'', approval:r.approval||'',
         completedBy:r.completed_by||'', completedAt:r.completed_at, createdAt:r.created_at };
       (r.status === 'done' ? done : pending).push(o);
     }
@@ -1118,6 +1253,37 @@ app.post('/repair-items/:id/reopen', requireAuth, async (req, res) => {
     await audit2(req.user.username, 'reopen', 'repair_item', req.params.id, null);
     res.json({ success:true });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reopen' }); }
+});
+
+// Sales approval for mechanic-added items: approved (light blue) / rejected (red).
+async function setRepairApproval(id, decision, username) {
+  await pgQuery(`UPDATE repair_items SET approval=$2 WHERE id=$1`, [id, decision]);
+  await audit2(username, decision === 'approved' ? 'approve' : 'reject', 'repair_item', String(id), null);
+  // Colour the matching cell on the mechanic's sheet; report exactly what happened.
+  const it = (await pgQuery(`SELECT sheet_id, list_row, source FROM repair_items WHERE id=$1`, [id])).rows[0];
+  if (!it) return { sheetSynced:false, sheetError:'item not found' };
+  if (!it.sheet_id || !it.list_row) {
+    return { sheetSynced:false, sheetError:'This item is not linked to a work-order sheet (no sheet_id/list_row) — it can only be coloured if it came from a sheet-based work order.' };
+  }
+  try {
+    await setApprovalColor(it.sheet_id, it.list_row, decision);
+    return { sheetSynced:true };
+  } catch(err) {
+    console.error('[approval] sheet colour failed:', err && err.message, err && err.errors);
+    return { sheetSynced:false, sheetError:(err && err.message) || 'sheet update failed' };
+  }
+}
+app.post('/repair-items/:id/approve', requireAuth, async (req, res) => {
+  try {
+    const r = await setRepairApproval(req.params.id, 'approved', req.user.username);
+    res.json({ success:true, ...r });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to approve' }); }
+});
+app.post('/repair-items/:id/reject', requireAuth, async (req, res) => {
+  try {
+    const r = await setRepairApproval(req.params.id, 'rejected', req.user.username);
+    res.json({ success:true, ...r });
+  } catch(e) { console.error(e); res.status(500).json({ error:'Failed to reject' }); }
 });
 
 // ── LENDER OUTCOMES (approval/decline history) ────────────────────────────────
@@ -1345,30 +1511,46 @@ app.post('/work-orders', requireAuth, async (req, res) => {
       ${d.notes ? `<h3 style="margin-bottom:4px;margin-top:16px;">Notes</h3><div style="font-size:14px;white-space:pre-wrap;">${esc(d.notes)}</div>` : ''}
       </body></html>`;
 
-    const drive = getDriveClient();
     const title = `Work Order — Unit ${d.unit||'?'} — ${date}`;
-    const created = await drive.files.create({
-      requestBody: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] },
-      media: { mimeType: 'text/html', body: html },
-      fields: 'id, webViewLink',
-      supportsAllDrives: true,
-    });
-    const link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
-
-    // Record each issue in repair_items so it appears in the Repairs panel for sales to verify.
     const woKey = 'WO' + Date.now();
+    const masterId = masterWorkorderId();
+    let link, sheetId = '', listStart = 16, tab = 'Sheet1', mode = 'doc';
+
+    if (masterId) {
+      // Preferred: copy the master template Sheet and fill it in.
+      const made = await createWorkOrderSheet({
+        masterId, folderId, title,
+        mechanic: inspectedBy, date, company: d.company || 'Direct Truck Sales Inc.',
+        vin: d.vin || '', unit: d.unit || '', miles: d.miles || '', items
+      });
+      link = made.link; sheetId = made.sheetId; listStart = made.listStart; tab = made.tab; mode = 'sheet';
+      await pgQuery(`INSERT INTO work_orders (wo_key, unit, vehicle_desc, vin, miles, mechanic, company, priority, sheet_id, sheet_link, list_start_row, status, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'Open',$12)`,
+        [woKey, d.unit||'', d.vehicleDesc||'', d.vin||'', d.miles||'', inspectedBy, d.company||'', priority, sheetId, link, listStart, req.user.username]);
+    } else {
+      // Fallback (no master configured yet): the original Google Doc.
+      const drive = getDriveClient();
+      const created = await drive.files.create({
+        requestBody: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] },
+        media: { mimeType: 'text/html', body: html },
+        fields: 'id, webViewLink', supportsAllDrives: true,
+      });
+      link = created.data.webViewLink || ('https://docs.google.com/document/d/' + created.data.id);
+    }
+
+    // Record each issue in repair_items so it appears in the Repairs panel.
     try {
       for (let s = 0; s < items.length; s++) {
         await pgQuery(`
-          INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by)
-          VALUES ($1,$2,$3,$4,$5,'pending','work_order',$6,$7,$8)
+          INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id)
+          VALUES ($1,$2,$3,$4,$5,'pending','work_order',$6,$7,$8,$9,$10)
           ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
-          [woKey, d.unit||'', d.vehicleDesc||'', s+1, items[s], link, priority, inspectedBy]);
+          [woKey, d.unit||'', d.vehicleDesc||'', s+1, items[s], link, priority, inspectedBy, listStart + s, sheetId]);
       }
     } catch(recErr) { console.warn('[work-order] repair_items record failed:', recErr.message); }
 
-    await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority });
-    res.json({ success:true, docId: created.data.id, link, tracked: items.length });
+    await audit2(req.user.username, 'create', 'work_order', String(d.unit||''), { items: items.length, priority, mode });
+    res.json({ success:true, docId: sheetId || undefined, link, tracked: items.length, mode });
   } catch(e) {
     console.error('work order error', e);
     const msg = (e && e.message) ? e.message : 'unknown error';
@@ -1379,7 +1561,8 @@ app.post('/work-orders', requireAuth, async (req, res) => {
 // ── SOURCING (private acquisition pipeline; Tom + allowlisted users) ───────────
 const toCamelS = (s) => s.replace(/_([a-z0-9])/g, (_,c)=>c.toUpperCase());
 const SOURCING_FIELDS = ['name','dot_number','mc_number','contact_name','contact_phone','contact_email',
-  'city','state','fleet_size','cycle_years','last_purchase_year','next_contact_date','status','notes'];
+  'city','state','fleet_size','cycle_years','last_purchase_year','next_contact_date','status','notes',
+  'contact_role','trucks_run','cycle_notes','disposal_method','typical_tradein','available_now','interest'];
 
 app.get('/sourcing/companies', requireAuth, requireSourcing, async (req, res) => {
   try {
@@ -1389,9 +1572,16 @@ app.get('/sourcing/companies', requireAuth, requireSourcing, async (req, res) =>
     for (const u of units) { (byCo[u.company_id] = byCo[u.company_id] || []).push({
       id:u.id, year:u.year, make:u.make, model:u.model, qty:u.qty, vin:u.vin,
       foundWhere:u.found_where, foundDate:u.found_date, notes:u.notes }); }
+    const calls = (await pgQuery('SELECT * FROM sourcing_calls ORDER BY call_date DESC, id DESC')).rows;
+    const callsByCo = {};
+    for (const c of calls) { (callsByCo[c.company_id] = callsByCo[c.company_id] || []).push({
+      id:c.id, callDate:c.call_date, contactName:c.contact_name, interest:c.interest,
+      availableNow:c.available_now, outcome:c.outcome, nextFollowup:c.next_followup,
+      createdBy:c.created_by, createdAt:c.created_at }); }
     res.json(rows.map(r => {
       const o = {}; for (const k of Object.keys(r)) o[toCamelS(k)] = r[k];
       o.units = byCo[r.id] || [];
+      o.calls = callsByCo[r.id] || [];
       return o;
     }));
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load companies' }); }
@@ -1446,6 +1636,312 @@ app.post('/sourcing/units', requireAuth, requireSourcing, async (req, res) => {
 app.delete('/sourcing/units/:id', requireAuth, requireSourcing, async (req, res) => {
   try { await pgQuery('DELETE FROM sourcing_units WHERE id=$1', [req.params.id]); res.json({ success:true }); }
   catch(e) { res.status(500).json({ error:'Failed to delete unit' }); }
+});
+
+// Diagnostic for approval → sheet colouring (admins).
+app.get('/debug/approval', requireAuth, requireAdmin, async (req, res) => {
+  const out = { credsSet: !!process.env.GOOGLE_CREDENTIALS };
+  try {
+    const items = (await pgQuery(`SELECT id, description, approval, source, sheet_id, list_row
+      FROM repair_items WHERE approval <> '' ORDER BY id DESC LIMIT 25`)).rows;
+    out.approvalItems = items.map(i => ({ id:i.id, desc:i.description, approval:i.approval,
+      source:i.source, hasSheet: !!i.sheet_id, sheetId: i.sheet_id ? (i.sheet_id.slice(0,8)+'…') : null, listRow:i.list_row }));
+    out.count = items.length;
+    // Optional live test: /debug/approval?test=<itemId>
+    if (req.query.test) {
+      const it = items.find(x => String(x.id) === String(req.query.test)) ||
+                 (await pgQuery(`SELECT * FROM repair_items WHERE id=$1`, [req.query.test])).rows[0];
+      if (!it) out.test = { ok:false, reason:'item not found' };
+      else if (!it.sheet_id || !it.list_row) out.test = { ok:false, reason:'no sheet_id/list_row on this item' };
+      else {
+        try { await setApprovalColor(it.sheet_id, it.list_row, it.approval || 'approved');
+          out.test = { ok:true, colored:`sheet ${it.sheet_id.slice(0,8)}… row ${it.list_row} col K` }; }
+        catch(e) { out.test = { ok:false, reason:(e && e.message) || String(e), errors: e && e.errors }; }
+      }
+    }
+    out.result = 'OK';
+  } catch(e) { out.result = 'Error: ' + ((e && e.message) || e); }
+  res.json(out);
+});
+
+// ── WORK ORDER LIST + SYNC ────────────────────────────────────────────────────
+// List work orders (for the Repairs tab sync button).
+app.get('/work-orders', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`
+      SELECT w.*,
+        (SELECT count(*) FROM repair_items r WHERE r.bos_id = w.wo_key) AS item_count,
+        (SELECT count(*) FROM repair_items r WHERE r.bos_id = w.wo_key AND r.status='done') AS done_count
+      FROM work_orders w ORDER BY w.created_at DESC`);
+    res.json(rows.map(w => ({
+      id:w.id, unit:w.unit, vehicleDesc:w.vehicle_desc, mechanic:w.mechanic,
+      sheetLink:w.sheet_link, sheetId:w.sheet_id, status:w.status,
+      itemCount:Number(w.item_count)||0, doneCount:Number(w.done_count)||0, createdAt:w.created_at
+    })));
+  } catch(e) { console.error('list work orders', e); res.status(500).json({ error:'Failed to list work orders' }); }
+});
+
+// Sync one work order's mechanic sheet back into Repairs.
+async function syncOneWorkOrder(wo, username) {
+  if (!wo.sheet_id) return { updated:0, added:0, skipped:'no sheet' };
+  const { rows, allDone } = await readWorkOrderSheet(wo.sheet_id, null, wo.list_start_row || 16);
+  const existing = (await pgQuery(`SELECT * FROM repair_items WHERE bos_id=$1 ORDER BY item_slot`, [wo.wo_key])).rows;
+  const byRow = {}; let maxSlot = 0;
+  for (const it of existing) { if (it.list_row) byRow[it.list_row] = it; if (it.item_slot > maxSlot) maxSlot = it.item_slot; }
+  let updated = 0, added = 0;
+  for (const r of rows) {
+    if (!r.text) continue;
+    const doneNow = r.yellow || allDone;
+    const item = byRow[r.row];
+    if (item) {
+      const newStatus = doneNow ? 'done' : 'pending';
+      const descChanged = (item.description || '') !== r.text;
+      if (item.status !== newStatus || descChanged) {
+        if (newStatus === 'done') {
+          await pgQuery(`UPDATE repair_items SET description=$2, status='done',
+             completed_by=CASE WHEN status='done' THEN completed_by ELSE $3 END,
+             completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END WHERE id=$1`,
+            [item.id, r.text, 'mechanic (sheet)']);
+        } else {
+          await pgQuery(`UPDATE repair_items SET description=$2, status='pending', completed_by='', completed_at=NULL WHERE id=$1`,
+            [item.id, r.text]);
+        }
+        updated++;
+      }
+    } else {
+      maxSlot++;
+      await pgQuery(`INSERT INTO repair_items (bos_id, unit, vehicle_desc, item_slot, description, status, source, doc_link, priority, created_by, list_row, sheet_id, completed_by, completed_at, approval)
+        VALUES ($1,$2,$3,$4,$5,$6,'work_order',$7,$8,$9,$10,$11,$12,$13,'pending')
+        ON CONFLICT (bos_id, unit, item_slot) DO NOTHING`,
+        [wo.wo_key, wo.unit||'', wo.vehicle_desc||'', maxSlot, r.text, doneNow?'done':'pending',
+         wo.sheet_link||'', wo.priority||'', 'mechanic (sheet)', r.row, wo.sheet_id,
+         doneNow?'mechanic (sheet)':'', doneNow?new Date():null]);
+      added++;
+    }
+  }
+  if (allDone) {
+    await pgQuery(`UPDATE repair_items SET status='done',
+        completed_by=CASE WHEN status='done' THEN completed_by ELSE 'mechanic (sheet)' END,
+        completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END
+      WHERE bos_id=$1 AND status<>'done'`, [wo.wo_key]);
+    await pgQuery(`UPDATE work_orders SET status='Complete' WHERE id=$1`, [wo.id]);
+  } else {
+    await pgQuery(`UPDATE work_orders SET status='Open' WHERE id=$1`, [wo.id]);
+  }
+  return { updated, added, allDone };
+}
+
+app.post('/work-orders/:id/sync', requireAuth, async (req, res) => {
+  try {
+    const wo = (await pgQuery(`SELECT * FROM work_orders WHERE id=$1`, [req.params.id])).rows[0];
+    if (!wo) return res.status(404).json({ error:'Work order not found' });
+    const r = await syncOneWorkOrder(wo, req.user.username);
+    res.json({ success:true, ...r });
+  } catch(e) { console.error('wo sync', e); res.status(500).json({ error:'Sync failed: ' + (e.message||e) }); }
+});
+
+// Sync every open work order at once (button in the Repairs tab).
+app.post('/work-orders/sync-all', requireAuth, async (req, res) => {
+  try {
+    const wos = (await pgQuery(`SELECT * FROM work_orders WHERE sheet_id <> '' ORDER BY created_at DESC`)).rows;
+    let updated = 0, added = 0, synced = 0, completed = 0;
+    for (const wo of wos) {
+      try { const r = await syncOneWorkOrder(wo, req.user.username); updated += r.updated||0; added += r.added||0; synced++; if (r.allDone) completed++; }
+      catch(err) { console.warn('sync-all one failed', wo.id, err.message); }
+    }
+    res.json({ success:true, synced, updated, added, completed });
+  } catch(e) { console.error('wo sync-all', e); res.status(500).json({ error:'Sync failed' }); }
+});
+
+// ── SOURCING PIPELINE (Tom only) ─────────────────────────────────────────────
+const PIPELINE_STATUSES = ['Incoming','Pending inspection','Purchased','Arrived'];
+const PIPELINE_FIELDS = ['year','make','model','miles','ratio','apu','hp','transmission','warranty','vin','fob',
+  'price','status','source_type','source_name','source_contact','source_phone','expected_date','notes'];
+function pipelineRow(r) {
+  return { id:r.id, year:r.year, make:r.make, model:r.model, miles:r.miles, ratio:r.ratio, apu:r.apu, hp:r.hp,
+    transmission:r.transmission, warranty:r.warranty, vin:r.vin, fob:r.fob, price:r.price, status:r.status,
+    sourceType:r.source_type, sourceName:r.source_name, sourceContact:r.source_contact, sourcePhone:r.source_phone,
+    expectedDate:r.expected_date, notes:r.notes, purchasedAt:r.purchased_at, arrivedAt:r.arrived_at, createdAt:r.created_at, updatedAt:r.updated_at };
+}
+app.get('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const { rows } = await pgQuery(`SELECT * FROM sourcing_pipeline ORDER BY
+      CASE status WHEN 'Incoming' THEN 1 WHEN 'Pending inspection' THEN 2 WHEN 'Purchased' THEN 3 ELSE 4 END, updated_at DESC`);
+    res.json(rows.map(pipelineRow));
+  } catch(e) { console.error('pipeline list', e); res.status(500).json({ error:'Failed to load pipeline' }); }
+});
+app.post('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    const v = {
+      year:d.year, make:d.make, model:d.model, miles:d.miles, ratio:d.ratio, apu:d.apu, hp:d.hp,
+      transmission:d.transmission, warranty:d.warranty, vin:d.vin, fob:d.fob, price:d.price,
+      status: PIPELINE_STATUSES.includes(d.status) ? d.status : 'Incoming',
+      source_type: d.sourceType === 'Broker' ? 'Broker' : 'Fleet',
+      source_name:d.sourceName, source_contact:d.sourceContact, source_phone:d.sourcePhone,
+      expected_date:d.expectedDate, notes:d.notes
+    };
+    const vals = PIPELINE_FIELDS.map(k => v[k] == null ? '' : String(v[k]));
+    if (d.id) {
+      const sets = PIPELINE_FIELDS.map((k,i) => `${k}=$${i+2}`).join(', ');
+      await pgQuery(`UPDATE sourcing_pipeline SET ${sets}, updated_at=now(),
+        purchased_at = CASE WHEN $${PIPELINE_FIELDS.indexOf('status')+2} IN ('Purchased','Arrived') THEN COALESCE(purchased_at, now()) ELSE NULL END,
+        arrived_at   = CASE WHEN $${PIPELINE_FIELDS.indexOf('status')+2}='Arrived' THEN COALESCE(arrived_at, now()) ELSE NULL END
+        WHERE id=$1`, [d.id, ...vals]);
+      await audit2(req.user.username, 'update', 'sourcing_pipeline', String(d.id), { status:v.status });
+      return res.json({ success:true, id:d.id });
+    }
+    const cols = PIPELINE_FIELDS.join(',');
+    const ph = PIPELINE_FIELDS.map((_,i) => `$${i+1}`).join(',');
+    const r = await pgQuery(`INSERT INTO sourcing_pipeline (${cols}, created_by, purchased_at, arrived_at)
+      VALUES (${ph}, $${PIPELINE_FIELDS.length+1}, ${(v.status==='Purchased'||v.status==='Arrived') ? 'now()' : 'NULL'}, ${v.status==='Arrived' ? 'now()' : 'NULL'}) RETURNING id`,
+      [...vals, req.user.username]);
+    await audit2(req.user.username, 'create', 'sourcing_pipeline', String(r.rows[0].id), { status:v.status });
+    res.json({ success:true, id:r.rows[0].id });
+  } catch(e) { console.error('pipeline save', e); res.status(500).json({ error:'Failed to save unit' }); }
+});
+app.post('/sourcing/pipeline/:id/status', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const status = String((req.body||{}).status||'');
+    if (!PIPELINE_STATUSES.includes(status)) return res.status(400).json({ error:'Invalid status' });
+    await pgQuery(`UPDATE sourcing_pipeline SET status=$2, updated_at=now(),
+      purchased_at = CASE WHEN $2 IN ('Purchased','Arrived') THEN COALESCE(purchased_at, now()) ELSE NULL END,
+      arrived_at   = CASE WHEN $2='Arrived' THEN COALESCE(arrived_at, now()) ELSE NULL END WHERE id=$1`,
+      [req.params.id, status]);
+    await audit2(req.user.username, 'status', 'sourcing_pipeline', req.params.id, { status });
+    res.json({ success:true });
+  } catch(e) { console.error('pipeline status', e); res.status(500).json({ error:'Failed to update status' }); }
+});
+app.delete('/sourcing/pipeline/:id', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    await pgQuery('DELETE FROM sourcing_pipeline WHERE id=$1', [req.params.id]);
+    await audit2(req.user.username, 'delete', 'sourcing_pipeline', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ error:'Failed to delete' }); }
+});
+
+// Call log — one row per touchpoint. Logging a call can advance the follow-up date
+// and update the company's current interest, so the "contact soon" list stays honest.
+app.post('/sourcing/calls', requireAuth, requireSourcing, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body);
+    if (!d.companyId) return res.status(400).json({ error:'companyId required' });
+    if (d.id) {
+      await pgQuery(`UPDATE sourcing_calls SET call_date=$2, contact_name=$3, interest=$4, available_now=$5, outcome=$6, next_followup=$7 WHERE id=$1`,
+        [d.id, d.callDate||'', d.contactName||'', d.interest||'', d.availableNow||'', d.outcome||'', d.nextFollowup||'']);
+    } else {
+      await pgQuery(`INSERT INTO sourcing_calls (company_id, call_date, contact_name, interest, available_now, outcome, next_followup, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [d.companyId, d.callDate||'', d.contactName||'', d.interest||'', d.availableNow||'', d.outcome||'', d.nextFollowup||'', req.user.username]);
+    }
+    // Roll the call's follow-up + interest up onto the company record.
+    const sets = [], vals = [d.companyId]; let n = 2;
+    if (d.nextFollowup) { sets.push(`next_contact_date=$${n++}`); vals.push(d.nextFollowup); }
+    if (d.interest)     { sets.push(`interest=$${n++}`); vals.push(d.interest); }
+    if (d.availableNow) { sets.push(`available_now=$${n++}`); vals.push(d.availableNow); }
+    if (sets.length) { await pgQuery(`UPDATE sourcing_companies SET ${sets.join(', ')}, updated_at=now() WHERE id=$1`, vals); }
+    res.json({ success:true });
+  } catch(e) { console.error('sourcing call', e); res.status(500).json({ error:'Failed to save call' }); }
+});
+app.delete('/sourcing/calls/:id', requireAuth, requireSourcing, async (req, res) => {
+  try { await pgQuery('DELETE FROM sourcing_calls WHERE id=$1', [req.params.id]); res.json({ success:true }); }
+  catch(e) { res.status(500).json({ error:'Failed to delete call' }); }
+});
+
+// ── FACTORY WARRANTY LOOKUP ───────────────────────────────────────────────────
+// PDFs named by unit number live in a shared-drive folder (WARRANTY_FOLDER_ID).
+// Any authenticated CRM user can look one up and stream it for viewing/printing;
+// the service account does the Drive access, so the user needs no Google access.
+function warrantyFolderId() {
+  return (process.env.WARRANTY_FOLDER_ID || '').trim().replace(/[.\/\s]+$/,'');
+}
+
+// Search the warranty folder for PDF(s) matching a unit number.
+app.get('/warranty/search', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.status(400).json({ error:'Warranty folder not configured (set WARRANTY_FOLDER_ID to the shared Drive folder).' });
+    const unit = String(req.query.unit || '').trim();
+    if (!unit) return res.json({ found:false, files:[] });
+    const safe = unit.replace(/['\\]/g, '');   // escape for the Drive query string
+    const drive = getDriveClient();
+    const q = `'${folderId}' in parents and trashed=false and mimeType='application/pdf' and name contains '${safe}'`;
+    const list = await drive.files.list({
+      q, fields:'files(id,name)', pageSize:25,
+      supportsAllDrives:true, includeItemsFromAllDrives:true
+    });
+    const files = (list.data.files || []).map(f => ({ id:f.id, name:f.name }));
+    // Prefer an exact "<unit>.pdf" match first, then other name-contains matches.
+    const exact = files.filter(f => f.name.toLowerCase() === (unit.toLowerCase()+'.pdf'));
+    const rest  = files.filter(f => f.name.toLowerCase() !== (unit.toLowerCase()+'.pdf'));
+    const ordered = exact.concat(rest);
+    res.json({ found: ordered.length > 0, files: ordered });
+  } catch(e) { console.error('warranty search', e); res.status(500).json({ error:'Warranty search failed' }); }
+});
+
+// List every warranty PDF in the folder (id, name, and stem = name without .pdf),
+// so the inventory can show a Yes/No column without a Drive call per row.
+app.get('/warranty/list', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.json({ files: [], configured:false });
+    const drive = getDriveClient();
+    const files = []; let pageToken;
+    do {
+      const list = await drive.files.list({
+        q:`'${folderId}' in parents and trashed=false and mimeType='application/pdf'`,
+        fields:'nextPageToken, files(id,name)', pageSize:1000, pageToken,
+        supportsAllDrives:true, includeItemsFromAllDrives:true
+      });
+      (list.data.files || []).forEach(f => files.push({ id:f.id, name:f.name, stem:f.name.replace(/\.pdf$/i,'') }));
+      pageToken = list.data.nextPageToken;
+    } while (pageToken);
+    res.json({ files, configured:true });
+  } catch(e) { console.error('warranty list', e); res.status(500).json({ error:'Warranty list failed' }); }
+});
+
+// Stream a warranty PDF by file id (only if it lives in the warranty folder).
+app.get('/warranty/file/:fileId', requireAuth, async (req, res) => {
+  try {
+    const folderId = warrantyFolderId();
+    if (!folderId) return res.status(400).json({ error:'Warranty folder not configured.' });
+    const fileId = String(req.params.fileId || '').trim();
+    const drive = getDriveClient();
+    // Security: confirm the file is inside the warranty folder before streaming it.
+    const meta = await drive.files.get({ fileId, fields:'id,name,mimeType,parents', supportsAllDrives:true });
+    const parents = meta.data.parents || [];
+    if (!parents.includes(folderId)) return res.status(403).json({ error:'File is not in the warranty folder.' });
+    if (meta.data.mimeType !== 'application/pdf') return res.status(400).json({ error:'File is not a PDF.' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="' + (meta.data.name || 'warranty.pdf').replace(/"/g,'') + '"');
+    const stream = await drive.files.get(
+      { fileId, alt:'media', supportsAllDrives:true },
+      { responseType:'stream' }
+    );
+    stream.data.on('error', err => { console.error('warranty stream', err); if (!res.headersSent) res.status(500).end(); });
+    stream.data.pipe(res);
+  } catch(e) { console.error('warranty file', e); res.status(500).json({ error:'Could not load warranty file' }); }
+});
+
+// Admin diagnostic for warranty folder configuration.
+app.get('/debug/warranty', requireAuth, requireAdmin, async (req, res) => {
+  const out = { folderIdSet: !!process.env.WARRANTY_FOLDER_ID, credsSet: !!process.env.GOOGLE_CREDENTIALS };
+  const folderId = warrantyFolderId();
+  out.folderId = folderId || null;
+  if (!folderId) { out.result = 'WARRANTY_FOLDER_ID env var is not set.'; return res.json(out); }
+  try {
+    const drive = getDriveClient();
+    const meta = await drive.files.get({ fileId: folderId, fields:'id,name,mimeType,driveId', supportsAllDrives:true });
+    out.folderName = meta.data.name; out.isSharedDrive = !!meta.data.driveId;
+    const fl = await drive.files.list({
+      q:`'${folderId}' in parents and trashed=false and mimeType='application/pdf'`,
+      fields:'files(id,name)', pageSize:10, supportsAllDrives:true, includeItemsFromAllDrives:true
+    });
+    out.samplePdfs = (fl.data.files || []).map(f => f.name);
+    out.pdfCount = out.samplePdfs.length;
+    out.result = 'OK — folder reachable.';
+  } catch(e) { out.result = 'Error: ' + (e.message || e); }
+  res.json(out);
 });
 
 // FMCSA carrier lookup by USDOT number (free public API; needs FMCSA_API_KEY / webKey)
@@ -1531,19 +2027,22 @@ app.get('/search', requireAuth, async (req, res) => {
     });
 
     // Bills of sale
+    const numTerm = digits.length ? digits : '__nonum__';
     const bos = (await pgQuery(`
-      SELECT b.id, b.personal_name, b.business_name, b.total, b.lead_id,
+      SELECT b.id, b.personal_name, b.business_name, b.total, b.lead_id, b.bos_number, b.completion_status,
         string_agg(u.vin,', ') FILTER (WHERE u.vin<>'') AS vins,
         string_agg(u.unit,', ') FILTER (WHERE u.unit<>'') AS units
       FROM bills_of_sale b LEFT JOIN bos_units u ON u.bos_id=b.id
-      WHERE lower(b.personal_name) LIKE $1 OR lower(b.business_name) LIKE $1
+      WHERE b.deleted_at IS NULL AND (
+        lower(b.personal_name) LIKE $1 OR lower(b.business_name) LIKE $1
         OR lower(u.vin) LIKE $1 OR lower(u.unit) LIKE $1
-      GROUP BY b.id LIMIT 12`, [term])).rows;
+        OR CAST(b.bos_number AS TEXT) LIKE $3)
+      GROUP BY b.id LIMIT 12`, [term, phoneTerm, '%'+numTerm+'%'])).rows;
     for (const b of bos) results.push({
       type: 'bill_of_sale', id: b.id, leadId: b.lead_id || '',
-      title: b.personal_name || b.business_name || b.id,
+      title: (b.bos_number ? '#'+b.bos_number+' — ' : '') + (b.personal_name || b.business_name || b.id),
       sub: [b.units ? 'Unit '+b.units : '', b.total ? '$'+Number(b.total).toLocaleString() : ''].filter(Boolean).join(' · '),
-      tag: 'Bill of Sale',
+      tag: b.bos_number ? ('BOS #'+b.bos_number) : 'Bill of Sale',
     });
 
     // Closing packages
@@ -2008,6 +2507,11 @@ app.post('/billsofsale/generate', requireAuth, async (req, res) => {
 
     const p1=pdfDoc.addPage([W,H]);
     let y=await addHeader(p1,'BILL OF SALE');
+    // Bill-of-sale number (invoice-style), if assigned
+    if (d.bosNumber) {
+      const noStr = 'BILL OF SALE #' + d.bosNumber;
+      dt(p1, noStr, W - M - (String(noStr).length*6.2), y+6, { bold:true, size:10 });
+    }
     const LBL=86,VAL=W/2-M-LBL-8,col1=M+6,col2=W/2+6;
     const row=(pg,yp,l1,v1,l2,v2)=>{
       dt(pg,l1,col1,yp,{bold:true,size:8.5});dt(pg,v1||'',col1+LBL,yp,{size:8.5,maxWidth:VAL});
@@ -2275,7 +2779,9 @@ app.post('/billsofsale/save', requireAuth, async (req, res) => {
     } catch(e) {}
 
     await DBW.mirrorBillOfSale(id, d, req.user && req.user.username);
-    res.json({success:true,id});
+    let bosNumber = null;
+    try { const nr = await pgQuery('SELECT bos_number FROM bills_of_sale WHERE id=$1', [id]); if (nr.rows.length) bosNumber = nr.rows[0].bos_number; } catch(e) {}
+    res.json({success:true, id, bosNumber});
     // Notify finance + owners when a deposit was taken (non-blocking, never throws)
     try {
       const dep = parseFloat(String(d.depositAmount||'').replace(/[^0-9.]/g,''));
