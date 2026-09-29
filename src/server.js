@@ -853,16 +853,16 @@ app.get('/upcoming', requireAuth, async (req, res) => {
       expectedDate:r.expected_date||'', expectedPrice:r.expected_price||'', notes:r.notes||'',
       createdBy:r.created_by||'',
     }));
-    // Purchased units from the sourcing pipeline. Whitelisted fields only — price, fleet/broker
+    // Purchased units from the sourcing pipeline. Whitelisted fields only — price, FOB, fleet/broker
     // name/contact/phone and private notes are deliberately never selected or sent.
     let purchased = [];
     try {
-      const p = await pgQuery(`SELECT id, year, make, model, miles, ratio, apu, hp, transmission, warranty, vin, fob, expected_date
+      const p = await pgQuery(`SELECT id, year, make, model, miles, ratio, apu, hp, transmission, warranty, vin, expected_date, purchased_at
         FROM sourcing_pipeline WHERE status='Purchased' ORDER BY expected_date ASC NULLS LAST, purchased_at DESC`);
       purchased = p.rows.map(r => ({
         id:'P'+r.id, source:'pipeline', year:r.year||'', make:r.make||'', model:r.model||'', miles:r.miles||'',
         hours:'', apu:r.apu||'', color:'', hp:r.hp||'', ratio:r.ratio||'', vin:r.vin||'',
-        transmission:r.transmission||'', warranty:r.warranty||'', fob:r.fob||'',
+        transmission:r.transmission||'', warranty:r.warranty||'', purchasedAt:r.purchased_at||null,
         expectedDate:r.expected_date||'', expectedPrice:'', notes:'', createdBy:''
       }));
     } catch(pe) { /* table not migrated yet — just show manual upcoming units */ }
@@ -1758,29 +1758,40 @@ app.post('/work-orders/sync-all', requireAuth, async (req, res) => {
 });
 
 // ── SOURCING PIPELINE (Tom only) ─────────────────────────────────────────────
-const PIPELINE_STATUSES = ['Incoming','Pending inspection','Purchased','Arrived'];
+const PIPELINE_STATUSES = ['Working','Pending inspection','Purchased','Arrived'];
+// 'Incoming' was renamed to 'Working'; accept it from any stale screen.
+function normPipelineStatus(st) { st = String(st||''); return st === 'Incoming' ? 'Working' : st; }
 const PIPELINE_FIELDS = ['year','make','model','miles','ratio','apu','hp','transmission','warranty','vin','fob',
   'price','status','source_type','source_name','source_contact','source_phone','expected_date','notes'];
 function pipelineRow(r) {
   return { id:r.id, year:r.year, make:r.make, model:r.model, miles:r.miles, ratio:r.ratio, apu:r.apu, hp:r.hp,
-    transmission:r.transmission, warranty:r.warranty, vin:r.vin, fob:r.fob, price:r.price, status:r.status,
+    transmission:r.transmission, warranty:r.warranty, vin:r.vin, fob:r.fob, price:r.price, status:normPipelineStatus(r.status),
     sourceType:r.source_type, sourceName:r.source_name, sourceContact:r.source_contact, sourcePhone:r.source_phone,
     expectedDate:r.expected_date, notes:r.notes, purchasedAt:r.purchased_at, arrivedAt:r.arrived_at, createdAt:r.created_at, updatedAt:r.updated_at };
 }
 app.get('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
   try {
     const { rows } = await pgQuery(`SELECT * FROM sourcing_pipeline ORDER BY
-      CASE status WHEN 'Incoming' THEN 1 WHEN 'Pending inspection' THEN 2 WHEN 'Purchased' THEN 3 ELSE 4 END, updated_at DESC`);
+      CASE status WHEN 'Working' THEN 1 WHEN 'Incoming' THEN 1 WHEN 'Pending inspection' THEN 2 WHEN 'Purchased' THEN 3 ELSE 4 END, updated_at DESC`);
     res.json(rows.map(pipelineRow));
   } catch(e) { console.error('pipeline list', e); res.status(500).json({ error:'Failed to load pipeline' }); }
 });
 app.post('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) => {
   try {
     const d = sanitizeObj(req.body);
+    d.status = normPipelineStatus(d.status);
+    // 'Dead' = deal didn't work out: remove the unit entirely.
+    if (d.status === 'Dead') {
+      if (d.id) {
+        await pgQuery('DELETE FROM sourcing_pipeline WHERE id=$1', [d.id]);
+        await audit2(req.user.username, 'dead', 'sourcing_pipeline', String(d.id), null);
+      }
+      return res.json({ success:true, deleted:true });
+    }
     const v = {
       year:d.year, make:d.make, model:d.model, miles:d.miles, ratio:d.ratio, apu:d.apu, hp:d.hp,
       transmission:d.transmission, warranty:d.warranty, vin:d.vin, fob:d.fob, price:d.price,
-      status: PIPELINE_STATUSES.includes(d.status) ? d.status : 'Incoming',
+      status: PIPELINE_STATUSES.includes(d.status) ? d.status : 'Working',
       source_type: d.sourceType === 'Broker' ? 'Broker' : 'Fleet',
       source_name:d.sourceName, source_contact:d.sourceContact, source_phone:d.sourcePhone,
       expected_date:d.expectedDate, notes:d.notes
@@ -1806,7 +1817,12 @@ app.post('/sourcing/pipeline', requireAuth, requirePipeline, async (req, res) =>
 });
 app.post('/sourcing/pipeline/:id/status', requireAuth, requirePipeline, async (req, res) => {
   try {
-    const status = String((req.body||{}).status||'');
+    const status = normPipelineStatus((req.body||{}).status);
+    if (status === 'Dead') {
+      await pgQuery('DELETE FROM sourcing_pipeline WHERE id=$1', [req.params.id]);
+      await audit2(req.user.username, 'dead', 'sourcing_pipeline', req.params.id, null);
+      return res.json({ success:true, deleted:true });
+    }
     if (!PIPELINE_STATUSES.includes(status)) return res.status(400).json({ error:'Invalid status' });
     await pgQuery(`UPDATE sourcing_pipeline SET status=$2, updated_at=now(),
       purchased_at = CASE WHEN $2 IN ('Purchased','Arrived') THEN COALESCE(purchased_at, now()) ELSE NULL END,
