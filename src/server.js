@@ -484,8 +484,8 @@ app.post('/auth/login', async (req, res) => {
 
 // ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
 // Public build check: open <server-url>/version in a browser to confirm what's deployed.
-const SERVER_BUILD = '2026-09-29-pipeline-arrived';
-app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
+const SERVER_BUILD = '2026-10-10-future-leads';
+app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['future-leads','sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
 
 app.get('/me', requireAuth, async (req, res) => {
   let sourcing = (req.user.username === 'tom');
@@ -523,6 +523,20 @@ app.get('/leads', requireAuth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to load leads' }); }
 });
 
+// Buying info (cash/finance, budget, timeline) — only fields actually sent are written,
+// so screens that save a lead without these fields never blank them.
+async function saveLeadBuyingInfo(id, l) {
+  if (!id || !(await usePg())) return;
+  const map = { purchaseType:'purchase_type', budget:'budget', timeline:'timeline' };
+  const sets = [], vals = [id];
+  for (const k of Object.keys(map)) {
+    if (l[k] !== undefined) { vals.push(String(l[k]||'')); sets.push(`${map[k]}=$${vals.length}`); }
+  }
+  if (!sets.length) return;
+  try { await pgQuery(`UPDATE leads SET ${sets.join(', ')} WHERE id=$1`, vals); }
+  catch(e) { console.warn('[leads] buying info not saved (run add-future-leads.sql):', e.message); }
+}
+
 app.post('/leads', requireAuth, async (req, res) => {
   try {
     const sheets = getSheetsClient();
@@ -537,6 +551,7 @@ app.post('/leads', requireAuth, async (req, res) => {
         l.dlNumber||'',l.dlState||'',l.deals?JSON.stringify(l.deals):'']] }
     });
     await DBW.mirrorLeadInsert(id, l, req.user && req.user.username);
+    await saveLeadBuyingInfo(id, l);
     res.json({ success:true, id });
   } catch(e) { console.error(e); res.status(500).json({ error:'Failed to save lead' }); }
 });
@@ -548,6 +563,7 @@ app.put('/leads/:rowIndex', requireAuth, async (req, res) => {
     // Postgres is the source of truth — write it FIRST so the save can't be
     // lost by a Sheets hiccup. mirrorLeadUpdate throws if PG fails (primary mode).
     await DBW.mirrorLeadUpdate(l, req.user && req.user.username);
+    await saveLeadBuyingInfo(l.id, l);
 
     // Best-effort Sheets mirror (only when enabled). Never blocks the save.
     if (WRITE_TO_SHEETS) {
@@ -604,6 +620,78 @@ async function appendRowSafe(sheets, tab, rowValues) {
     requestBody: { values: [rowValues] }
   });
 }
+
+// ── FUTURE LEADS ──────────────────────────────────────────────────────────────
+// Buyers waiting for a truck we don't have yet. Visible to all roles.
+const FL_TEXT = ['first_name','last_name','company','phone','email','address','city','state','zip','source',
+  'salesperson','purchase_type','budget','timeline','year_min','year_max','miles_max','wants_notes','followup','notes','status'];
+const FL_JSON = ['makes','models','options'];
+const FL_KEYS = { first_name:'first', last_name:'last', company:'company', phone:'phone', email:'email', address:'address',
+  city:'city', state:'state', zip:'zip', source:'source', salesperson:'sales', purchase_type:'purchaseType', budget:'budget',
+  timeline:'timeline', year_min:'yearMin', year_max:'yearMax', miles_max:'milesMax', wants_notes:'wantsNotes',
+  followup:'followup', notes:'notes', status:'status', makes:'makes', models:'models', options:'options' };
+function flParse(v) { try { const a = JSON.parse(v||'[]'); return Array.isArray(a) ? a : []; } catch(e) { return []; } }
+function flRow(r, contacts) {
+  const o = { id:r.id, createdBy:r.created_by, createdAt:r.created_at, updatedAt:r.updated_at, contacts: contacts||[] };
+  for (const c of FL_TEXT) o[FL_KEYS[c]] = r[c] || '';
+  for (const c of FL_JSON) o[FL_KEYS[c]] = flParse(r[c]);
+  if (!o.status) o.status = 'Active';
+  return o;
+}
+app.get('/future-leads', requireAuth, async (req, res) => {
+  try {
+    const rows = (await pgQuery(`SELECT * FROM future_leads ORDER BY
+      CASE status WHEN 'Active' THEN 1 ELSE 2 END, updated_at DESC`)).rows;
+    const cs = (await pgQuery(`SELECT * FROM future_lead_contacts ORDER BY contacted_at DESC`)).rows;
+    const byLead = {};
+    for (const c of cs) (byLead[c.future_lead_id] = byLead[c.future_lead_id] || []).push(
+      { unit:c.unit, unitDesc:c.unit_desc, by:c.contacted_by, at:c.contacted_at });
+    res.json(rows.map(r => flRow(r, byLead[r.id])));
+  } catch(e) { console.error('future leads list', e); res.status(500).json({ error:'Failed to load future leads (has add-future-leads.sql been run?)' }); }
+});
+app.post('/future-leads', requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const d = sanitizeObj(b);
+    const vals = FL_TEXT.map(c => String(d[FL_KEYS[c]] == null ? '' : d[FL_KEYS[c]]));
+    // arrays come straight from the body (sanitizeObj may not keep arrays); clean each entry
+    const arr = k => JSON.stringify((Array.isArray(b[k]) ? b[k] : []).map(x => String(x).replace(/[<>]/g,'').trim().slice(0,80)).filter(Boolean).slice(0,60));
+    FL_JSON.forEach(c => vals.push(arr(FL_KEYS[c])));
+    const cols = FL_TEXT.concat(FL_JSON);
+    if (!vals[cols.indexOf('status')]) vals[cols.indexOf('status')] = 'Active';
+    if (d.id) {
+      const sets = cols.map((c,i) => `${c}=$${i+2}`).join(', ');
+      await pgQuery(`UPDATE future_leads SET ${sets}, updated_at=now() WHERE id=$1`, [d.id, ...vals]);
+      await audit2(req.user.username, 'update', 'future_lead', String(d.id), null);
+      return res.json({ success:true, id:d.id });
+    }
+    const ph = cols.map((_,i) => `$${i+1}`).join(',');
+    const r = await pgQuery(`INSERT INTO future_leads (${cols.join(',')}, created_by) VALUES (${ph}, $${cols.length+1}) RETURNING id`,
+      [...vals, req.user.username]);
+    await audit2(req.user.username, 'create', 'future_lead', String(r.rows[0].id), null);
+    res.json({ success:true, id:r.rows[0].id });
+  } catch(e) { console.error('future lead save', e); res.status(500).json({ error:'Failed to save future lead' }); }
+});
+app.delete('/future-leads/:id', requireAuth, async (req, res) => {
+  try {
+    await pgQuery('DELETE FROM future_lead_contacts WHERE future_lead_id=$1', [req.params.id]);
+    await pgQuery('DELETE FROM future_leads WHERE id=$1', [req.params.id]);
+    await audit2(req.user.username, 'delete', 'future_lead', req.params.id, null);
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ error:'Failed to delete' }); }
+});
+// Record that a future lead was emailed about a unit.
+app.post('/future-leads/contacted', requireAuth, async (req, res) => {
+  try {
+    const d = sanitizeObj(req.body || {});
+    const ids = (Array.isArray(req.body && req.body.ids) ? req.body.ids : []).map(x => parseInt(x,10)).filter(Boolean);
+    for (const id of ids) {
+      await pgQuery(`INSERT INTO future_lead_contacts (future_lead_id, unit, unit_desc, contacted_by) VALUES ($1,$2,$3,$4)`,
+        [id, d.unit||'', d.unitDesc||'', req.user.username]);
+    }
+    res.json({ success:true, logged: ids.length });
+  } catch(e) { console.error('future lead contacted', e); res.status(500).json({ error:'Failed to log contact' }); }
+});
 
 // ── LEAD ENRICHMENT: store client + deal info on the lead ─────────────────────
 app.post('/leads/enrich', requireAuth, async (req, res) => {
