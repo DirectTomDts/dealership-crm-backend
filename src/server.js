@@ -484,7 +484,7 @@ app.post('/auth/login', async (req, res) => {
 
 // ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
 // Public build check: open <server-url>/version in a browser to confirm what's deployed.
-const SERVER_BUILD = '2026-10-10-future-leads';
+const SERVER_BUILD = '2026-10-10-future-leads-2';
 app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['future-leads','sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
 
 app.get('/me', requireAuth, async (req, res) => {
@@ -679,6 +679,77 @@ app.delete('/future-leads/:id', requireAuth, async (req, res) => {
     await audit2(req.user.username, 'delete', 'future_lead', req.params.id, null);
     res.json({ success:true });
   } catch(e) { res.status(500).json({ error:'Failed to delete' }); }
+});
+// Branded PDF of selected trucks for one client (for Facebook / text / print when they have no email).
+app.post('/future-leads/pdf', requireAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const units = Array.isArray(b.units) ? b.units.slice(0, 40) : [];
+    if (!units.length) return res.status(400).json({ error:'Select at least one truck' });
+    // Standard PDF fonts only encode Latin-1; swap anything else so a stray emoji can't drop a line.
+    const safe = v => String(v == null ? '' : v).replace(/[^\x20-\x7E -ÿ–—‘’“”•…]/g, '').slice(0, 140);
+    const clientName = safe(b.clientName), company = safe(b.company), sales = safe(b.salesperson);
+    const pdfDoc = await PDFDocument.create();
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const logo = await pdfDoc.embedJpg(Buffer.from(LOGO_B64,'base64'));
+    const M = 44, W = 612, H = 792, accent = rgb(0.73,0.36,0.09), grey = rgb(0.42,0.42,0.42);
+    let page, y;
+    const txt = (t, x, yy, o = {}) => page.drawText(safe(t), { x, y:yy, size:o.size||10, font:o.bold?bold:font, color:o.color||rgb(0,0,0) });
+    const fit = (t, maxW, size, f) => { let s = safe(t); f = f || font; if (f.widthOfTextAtSize(s,size) <= maxW) return s;
+      while (s.length > 1 && f.widthOfTextAtSize(s+'…',size) > maxW) s = s.slice(0,-1); return s+'…'; };
+    function header() {
+      page = pdfDoc.addPage([W, H]); y = H - 46;
+      try { const d = logo.scaleToFit(130, 46); page.drawImage(logo, { x:M, y:y-d.height+10, width:d.width, height:d.height }); } catch(e) {}
+      const ax = W - M - 170;
+      txt('Direct Truck Sales Inc.', ax, y, { bold:true });
+      txt('15w740 N. Frontage Rd, Ste 2', ax, y-12, { size:8.5 });
+      txt('Burr Ridge, IL 60527', ax, y-23, { size:8.5 });
+      txt('630-701-1000', ax, y-34, { size:8.5 });
+      txt('Sales@Direct-Truck.com', ax, y-45, { size:8.5, color:rgb(0,0.3,0.7) });
+      y -= 66;
+      page.drawRectangle({ x:M, y:y-18, width:W-M*2, height:26, color:rgb(0.12,0.12,0.12) });
+      const title = 'TRUCKS SELECTED FOR YOU';
+      txt(title, W/2 - bold.widthOfTextAtSize(title, 13)/2, y-10, { size:13, bold:true, color:rgb(1,1,1) });
+      y -= 38;
+    }
+    header();
+    const who = [clientName, company && company !== clientName ? company : ''].filter(Boolean).join(' · ');
+    if (who) { txt('Prepared for: ' + who, M, y, { size:10.5, bold:true }); y -= 14; }
+    txt(new Date().toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' }) + (sales ? '   ·   Your contact: ' + sales + ', 630-701-1000' : ''), M, y, { size:9, color:grey });
+    y -= 22;
+    for (const u of units) {
+      const specs = (Array.isArray(u.specs) ? u.specs : []).filter(p => Array.isArray(p) && p[1]).slice(0, 12);
+      const rows = Math.ceil(specs.length / 2);
+      const need = 40 + rows * 14;
+      if (y - need < 60) header();
+      const price = safe(u.price);
+      txt(fit(u.title, W - M*2 - 120, 13, bold), M, y, { size:13, bold:true });
+      if (price) txt(price, W - M - bold.widthOfTextAtSize(price, 13), y, { size:13, bold:true, color:accent });
+      y -= 14;
+      const sub = safe(u.sub);
+      if (sub) { txt(sub, M, y, { size:9, color: u.upcoming ? accent : grey }); y -= 14; }
+      y -= 2;
+      const colW = (W - M*2) / 2;
+      specs.forEach((p, i) => {
+        const x = M + (i % 2) * colW, yy = y - Math.floor(i / 2) * 14;
+        txt(safe(p[0]) + ':', x, yy, { size:9.5, bold:true });
+        txt(fit(p[1], colW - 92, 9.5), x + 86, yy, { size:9.5 });
+      });
+      y -= rows * 14 + 6;
+      page.drawLine({ start:{ x:M, y }, end:{ x:W-M, y }, thickness:0.5, color:rgb(0.82,0.82,0.82) });
+      y -= 18;
+    }
+    if (y < 70) header();
+    txt('Want photos, a walk-around video, or to set up a time to see one? Call 630-701-1000 or visit www.direct-truck.com.', M, y, { size:9 });
+    y -= 13;
+    txt('Prices and availability subject to change.', M, y, { size:8, color:grey });
+    const bytes = await pdfDoc.save();
+    const fname = 'DirectTruckSales-' + (clientName || 'Trucks').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') + '.pdf';
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition','attachment; filename="' + fname + '"');
+    res.send(Buffer.from(bytes));
+  } catch(e) { console.error('future lead pdf', e); res.status(500).json({ error:'PDF generation failed' }); }
 });
 // Record that a future lead was emailed about a unit.
 app.post('/future-leads/contacted', requireAuth, async (req, res) => {
