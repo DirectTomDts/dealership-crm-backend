@@ -484,8 +484,8 @@ app.post('/auth/login', async (req, res) => {
 
 // ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
 // Public build check: open <server-url>/version in a browser to confirm what's deployed.
-const SERVER_BUILD = '2026-10-10-future-leads-2';
-app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['future-leads','sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
+const SERVER_BUILD = '2026-10-28-contacts';
+app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['contacts','future-leads','sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
 
 app.get('/me', requireAuth, async (req, res) => {
   let sourcing = (req.user.username === 'tom');
@@ -620,6 +620,118 @@ async function appendRowSafe(sheets, tab, rowValues) {
     requestBody: { values: [rowValues] }
   });
 }
+
+// ── CONTACTS / MARKETING LIST (Tom only) ─────────────────────────────────────
+// Everyone in the system — leads, future leads, buyers, test drivers — merged into one
+// list by email or phone, for email / text campaigns.
+function ctEmail(e) { e = String(e||'').trim().toLowerCase(); return /^[^\s@,;<>"]+@[^\s@,;<>"]+\.[^\s@,;<>"]+$/.test(e) ? e : ''; }
+function ctPhone(p) { let d = String(p||'').replace(/\D/g,''); if (d.length === 11 && d[0] === '1') d = d.slice(1); return d.length === 10 ? d : ''; }
+function ctTime(v) { const t = v ? new Date(v).getTime() : 0; return isNaN(t) ? 0 : t; }
+app.get('/contacts', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const recs = [];
+    const q = async (sql) => { try { return (await pgQuery(sql)).rows; } catch(e) { console.warn('[contacts] skipped:', e.message); return []; } };
+    for (const r of await q(`SELECT * FROM leads WHERE deleted_at IS NULL`)) {
+      const archived = r.archived || ['Sold','Dead'].includes(r.status);
+      recs.push({ type: archived ? 'Archived lead' : 'Active lead', first:r.first_name, last:r.last_name, company:r.company,
+        email:r.email, phone:r.phone, phone2:r.biz_phone, address:r.address, city:r.city || r.biz_city, state:r.state || r.biz_state, zip:r.zip || r.biz_zip,
+        sales:r.salesperson, source:r.source, status:r.status, interest:r.unit,
+        purchaseType:r.purchase_type, budget:r.budget, timeline:r.timeline,
+        created:r.created_at, updated:r.updated_at || r.created_at });
+    }
+    for (const r of await q(`SELECT * FROM future_leads`)) {
+      let makes = [], models = [];
+      try { makes = JSON.parse(r.makes||'[]'); models = JSON.parse(r.models||'[]'); } catch(e) {}
+      recs.push({ type:'Future lead', first:r.first_name, last:r.last_name, company:r.company, email:r.email, phone:r.phone,
+        address:r.address, city:r.city, state:r.state, zip:r.zip, sales:r.salesperson, source:r.source, status:'Future: ' + (r.status||'Active'),
+        interest:[].concat(makes, models).join(', '), purchaseType:r.purchase_type, budget:r.budget, timeline:r.timeline,
+        created:r.created_at, updated:r.updated_at || r.created_at });
+    }
+    const unitCount = {};
+    for (const r of await q(`SELECT bos_id, count(*)::int AS n FROM bos_units WHERE coalesce(unit,'') <> '' OR coalesce(make,'') <> '' GROUP BY bos_id`)) unitCount[r.bos_id] = r.n;
+    for (const r of await q(`SELECT * FROM bills_of_sale WHERE deleted_at IS NULL`)) {
+      if (['Cancelled','Superseded'].includes(r.completion_status)) continue;
+      const parts = String(r.personal_name||'').trim().split(/\s+/);
+      recs.push({ type:'Customer', first:parts[0]||'', last:parts.slice(1).join(' '), company:r.business_name, email:r.email,
+        phone:r.phone, phone2:r.biz_phone, address:r.address || r.biz_address, city:r.city || r.biz_city, state:r.state || r.biz_state, zip:r.zip || r.biz_zip,
+        sales:r.salesperson, bought:1, units:unitCount[r.id] || 1, boughtDate:r.bos_date || r.created_at,
+        created:r.created_at, updated:r.created_at });
+    }
+    for (const r of await q(`SELECT * FROM test_drives WHERE deleted_at IS NULL`)) {
+      const parts = String(r.customer_name||'').trim().split(/\s+/);
+      recs.push({ type:'Test drive', first:parts[0]||'', last:parts.slice(1).join(' '), phone:r.phone,
+        address:r.address, city:r.city, state:r.state, zip:r.zip, sales:r.salesperson,
+        interest:[r.make, r.model].filter(Boolean).join(' '), created:r.created_at, updated:r.created_at });
+    }
+    // Merge records that share an email or phone number.
+    const contacts = [], byEmail = {}, byPhone = {};
+    for (const r of recs) {
+      const em = ctEmail(r.email), ph = ctPhone(r.phone), ph2 = ctPhone(r.phone2);
+      if (!em && !ph && !ph2 && !String(r.first||r.last||r.company||'').trim()) continue;
+      let c = (em && byEmail[em]) || (ph && byPhone[ph]) || (ph2 && byPhone[ph2]) || null;
+      if (!c) {
+        c = { first:'', last:'', company:'', email:'', phone:'', phone2:'', address:'', city:'', state:'', zip:'', sales:'', source:'',
+              status:'', interest:[], purchaseType:'', budget:'', timeline:'', types:[], purchases:0, unitsBought:0,
+              lastPurchase:'', firstSeen:0, lastActivity:0, _latest:0 };
+        contacts.push(c);
+      }
+      const t = ctTime(r.updated || r.created);
+      const newer = t >= c._latest;
+      const fill = (k, v) => { v = String(v == null ? '' : v).trim(); if (v && (!c[k] || newer)) c[k] = v; };
+      if (r.first || r.last) { if (!c.first || newer) { c.first = String(r.first||'').trim(); c.last = String(r.last||'').trim(); } }
+      ['company','address','city','state','zip','sales','purchaseType','budget','timeline'].forEach(k => fill(k, r[k]));
+      if (em && !c.email) c.email = em;
+      if (ph) { if (!c.phone) c.phone = ph; else if (c.phone !== ph && !c.phone2) c.phone2 = ph; }
+      if (ph2 && ph2 !== c.phone && !c.phone2) c.phone2 = ph2;
+      if (r.source && !c.source) c.source = r.source;
+      if (r.status && (r.type === 'Active lead' || r.type === 'Archived lead' || !c.status) && newer) c.status = r.status;
+      if (r.interest && c.interest.indexOf(r.interest) < 0) c.interest.push(r.interest);
+      if (c.types.indexOf(r.type) < 0) c.types.push(r.type);
+      if (r.bought) {
+        c.purchases += 1; c.unitsBought += r.units || 1;
+        if (!c.lastPurchase || ctTime(r.boughtDate) > ctTime(c.lastPurchase)) c.lastPurchase = r.boughtDate;
+      }
+      const ct = ctTime(r.created);
+      if (ct && (!c.firstSeen || ct < c.firstSeen)) c.firstSeen = ct;
+      if (t > c.lastActivity) c.lastActivity = t;
+      if (newer) c._latest = t;
+      if (em) byEmail[em] = c;
+      if (ph) byPhone[ph] = c;
+      if (ph2) byPhone[ph2] = c;
+    }
+    // Unsubscribe / consent flags.
+    const prefs = { email:{}, phone:{} };
+    for (const p of await q(`SELECT * FROM contact_prefs`)) if (prefs[p.kind]) prefs[p.kind][p.value] = p;
+    const out = contacts.map((c, i) => {
+      const ep = c.email ? prefs.email[c.email] : null, pp = c.phone ? prefs.phone[c.phone] : null;
+      return { id:i+1, first:c.first, last:c.last, company:c.company, email:c.email, phone:c.phone, phone2:c.phone2,
+        address:c.address, city:c.city, state:(c.state||'').toUpperCase(), zip:c.zip, sales:c.sales, source:c.source, status:c.status,
+        interest:c.interest.join(' | '), purchaseType:c.purchaseType, budget:c.budget, timeline:c.timeline, types:c.types,
+        purchases:c.purchases, unitsBought:c.unitsBought, lastPurchase:c.lastPurchase ? String(c.lastPurchase).slice(0,10) : '',
+        firstSeen:c.firstSeen ? new Date(c.firstSeen).toISOString().slice(0,10) : '',
+        lastActivity:c.lastActivity ? new Date(c.lastActivity).toISOString().slice(0,10) : '',
+        emailOptOut: !!(ep && ep.opt_out), smsOptOut: !!(pp && pp.opt_out), smsConsent: !!(pp && pp.consent) };
+    }).sort((a, b) => (b.lastActivity||'').localeCompare(a.lastActivity||''));
+    res.json({ contacts: out, prefsReady: true });
+  } catch(e) { console.error('contacts', e); res.status(500).json({ error:'Failed to load contacts' }); }
+});
+// Record an unsubscribe / text consent. Body: { kind:'email'|'phone', value, optOut?, consent? }
+app.post('/contacts/prefs', requireAuth, requirePipeline, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const kind = b.kind === 'phone' ? 'phone' : b.kind === 'email' ? 'email' : '';
+    const value = kind === 'email' ? ctEmail(b.value) : kind === 'phone' ? ctPhone(b.value) : '';
+    if (!value) return res.status(400).json({ error:'Valid email or 10-digit phone required' });
+    const cur = (await pgQuery('SELECT * FROM contact_prefs WHERE kind=$1 AND value=$2', [kind, value])).rows[0] || {};
+    const optOut = b.optOut === undefined ? !!cur.opt_out : !!b.optOut;
+    const consent = kind === 'phone' ? (b.consent === undefined ? !!cur.consent : !!b.consent) : false;
+    await pgQuery(`INSERT INTO contact_prefs (kind, value, opt_out, consent, updated_by, updated_at) VALUES ($1,$2,$3,$4,$5,now())
+      ON CONFLICT (kind, value) DO UPDATE SET opt_out=$3, consent=$4, updated_by=$5, updated_at=now()`,
+      [kind, value, optOut, consent, req.user.username]);
+    await audit2(req.user.username, 'prefs', 'contact', kind + ':' + value, { optOut, consent });
+    res.json({ success:true, optOut, consent });
+  } catch(e) { console.error('contact prefs', e); res.status(500).json({ error:'Failed to save (has add-contacts.sql been run?)' }); }
+});
 
 // ── FUTURE LEADS ──────────────────────────────────────────────────────────────
 // Buyers waiting for a truck we don't have yet. Visible to all roles.
