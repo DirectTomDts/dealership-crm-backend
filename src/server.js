@@ -484,7 +484,7 @@ app.post('/auth/login', async (req, res) => {
 
 // ── CURRENT USER (fresh permissions; lets the client self-heal stale sessions) ─
 // Public build check: open <server-url>/version in a browser to confirm what's deployed.
-const SERVER_BUILD = '2026-10-28-contacts';
+const SERVER_BUILD = '2026-10-28-wo-complete';
 app.get('/version', (req, res) => res.json({ build: SERVER_BUILD, features: ['contacts','future-leads','sourcing-pipeline','pipeline-arrived','warranty','workorder-sheets','repair-approval'] }));
 
 app.get('/me', requireAuth, async (req, res) => {
@@ -1802,6 +1802,7 @@ app.post('/work-orders', requireAuth, async (req, res) => {
       await pgQuery(`INSERT INTO work_orders (wo_key, unit, vehicle_desc, vin, miles, mechanic, company, priority, sheet_id, sheet_link, list_start_row, status, created_by)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'Open',$12)`,
         [woKey, d.unit||'', d.vehicleDesc||'', d.vin||'', d.miles||'', inspectedBy, d.company||'', priority, sheetId, link, listStart, req.user.username]);
+      try { await pgQuery(`UPDATE work_orders SET folder_id=$2 WHERE wo_key=$1`, [woKey, folderId]); } catch(e) { /* add-workorder-complete.sql not run yet */ }
     } else {
       // Fallback (no master configured yet): the original Google Doc.
       const drive = getDriveClient();
@@ -1957,8 +1958,38 @@ app.get('/work-orders', requireAuth, async (req, res) => {
 });
 
 // Sync one work order's mechanic sheet back into Repairs.
+// Where is the work-order sheet now? 'in' = still in its folder, 'out' = moved somewhere else,
+// trashed, or deleted. 'unknown' = couldn't tell (no folder set or a temporary Google error).
+async function workOrderLocation(wo) {
+  const home = (wo.folder_id || workOrderFolderId() || '').trim();
+  if (!home || !wo.sheet_id) return { where:'unknown' };
+  try {
+    const f = (await getDriveClient().files.get({ fileId: wo.sheet_id, fields:'id,parents,trashed', supportsAllDrives:true })).data;
+    if (f.trashed) return { where:'out', reason:'sheet moved to trash' };
+    if (!(f.parents || []).includes(home)) return { where:'out', reason:'sheet moved out of the work-order folder' };
+    return { where:'in' };
+  } catch(e) {
+    const code = (e && (e.code || (e.response && e.response.status))) || 0;
+    // 404 = gone or moved somewhere this account can't see (e.g. a private "Completed" folder).
+    if (code === 404) return { where:'out', reason:'sheet no longer in the work-order folder' };
+    return { where:'unknown', error: e && e.message };
+  }
+}
+async function completeWorkOrder(wo, reason) {
+  await pgQuery(`UPDATE repair_items SET status='done',
+      completed_by=CASE WHEN status='done' THEN completed_by ELSE 'work order completed' END,
+      completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END
+    WHERE bos_id=$1 AND status<>'done'`, [wo.wo_key]);
+  await pgQuery(`UPDATE work_orders SET status='Complete' WHERE id=$1`, [wo.id]);
+  try { await pgQuery(`UPDATE work_orders SET completed_at=COALESCE(completed_at, now()), completed_reason=$2 WHERE id=$1`, [wo.id, reason||'']); } catch(e) {}
+}
 async function syncOneWorkOrder(wo, username) {
   if (!wo.sheet_id) return { updated:0, added:0, skipped:'no sheet' };
+  // 1) Moved out of the folder / trashed / deleted -> the whole work order is complete.
+  const loc = await workOrderLocation(wo);
+  if (loc.where === 'out') { await completeWorkOrder(wo, loc.reason); return { updated:0, added:0, allDone:true, moved:true }; }
+  // 2) Still in the folder: read it. Sync only ever marks things DONE — it never un-does an item,
+  //    so something checked off in Repairs stays done even if it isn't highlighted on the sheet.
   const { rows, allDone } = await readWorkOrderSheet(wo.sheet_id, null, wo.list_start_row || 16);
   const existing = (await pgQuery(`SELECT * FROM repair_items WHERE bos_id=$1 ORDER BY item_slot`, [wo.wo_key])).rows;
   const byRow = {}; let maxSlot = 0;
@@ -1969,18 +2000,14 @@ async function syncOneWorkOrder(wo, username) {
     const doneNow = r.yellow || allDone;
     const item = byRow[r.row];
     if (item) {
-      const newStatus = doneNow ? 'done' : 'pending';
+      const markDone = doneNow && item.status !== 'done';
       const descChanged = (item.description || '') !== r.text;
-      if (item.status !== newStatus || descChanged) {
-        if (newStatus === 'done') {
-          await pgQuery(`UPDATE repair_items SET description=$2, status='done',
-             completed_by=CASE WHEN status='done' THEN completed_by ELSE $3 END,
-             completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END WHERE id=$1`,
-            [item.id, r.text, 'mechanic (sheet)']);
-        } else {
-          await pgQuery(`UPDATE repair_items SET description=$2, status='pending', completed_by='', completed_at=NULL WHERE id=$1`,
-            [item.id, r.text]);
-        }
+      if (markDone) {
+        await pgQuery(`UPDATE repair_items SET description=$2, status='done', completed_by=$3, completed_at=now() WHERE id=$1`,
+          [item.id, r.text, 'mechanic (sheet)']);
+        updated++;
+      } else if (descChanged) {
+        await pgQuery(`UPDATE repair_items SET description=$2 WHERE id=$1`, [item.id, r.text]);
         updated++;
       }
     } else {
@@ -1994,15 +2021,7 @@ async function syncOneWorkOrder(wo, username) {
       added++;
     }
   }
-  if (allDone) {
-    await pgQuery(`UPDATE repair_items SET status='done',
-        completed_by=CASE WHEN status='done' THEN completed_by ELSE 'mechanic (sheet)' END,
-        completed_at=CASE WHEN status='done' THEN completed_at ELSE now() END
-      WHERE bos_id=$1 AND status<>'done'`, [wo.wo_key]);
-    await pgQuery(`UPDATE work_orders SET status='Complete' WHERE id=$1`, [wo.id]);
-  } else {
-    await pgQuery(`UPDATE work_orders SET status='Open' WHERE id=$1`, [wo.id]);
-  }
+  if (allDone) { await completeWorkOrder(wo, 'ALL DONE checked on the sheet'); }
   return { updated, added, allDone };
 }
 
@@ -2010,6 +2029,7 @@ app.post('/work-orders/:id/sync', requireAuth, async (req, res) => {
   try {
     const wo = (await pgQuery(`SELECT * FROM work_orders WHERE id=$1`, [req.params.id])).rows[0];
     if (!wo) return res.status(404).json({ error:'Work order not found' });
+    if (wo.status === 'Complete') return res.json({ success:true, updated:0, added:0, allDone:true, alreadyComplete:true });
     const r = await syncOneWorkOrder(wo, req.user.username);
     res.json({ success:true, ...r });
   } catch(e) { console.error('wo sync', e); res.status(500).json({ error:'Sync failed: ' + (e.message||e) }); }
@@ -2018,13 +2038,18 @@ app.post('/work-orders/:id/sync', requireAuth, async (req, res) => {
 // Sync every open work order at once (button in the Repairs tab).
 app.post('/work-orders/sync-all', requireAuth, async (req, res) => {
   try {
-    const wos = (await pgQuery(`SELECT * FROM work_orders WHERE sheet_id <> '' ORDER BY created_at DESC`)).rows;
-    let updated = 0, added = 0, synced = 0, completed = 0;
+    // Completed work orders are finished — don't touch them again.
+    const wos = (await pgQuery(`SELECT * FROM work_orders WHERE sheet_id <> '' AND coalesce(status,'Open') <> 'Complete' ORDER BY created_at DESC`)).rows;
+    let updated = 0, added = 0, synced = 0, completed = 0, moved = 0, failed = 0;
     for (const wo of wos) {
-      try { const r = await syncOneWorkOrder(wo, req.user.username); updated += r.updated||0; added += r.added||0; synced++; if (r.allDone) completed++; }
-      catch(err) { console.warn('sync-all one failed', wo.id, err.message); }
+      try {
+        const r = await syncOneWorkOrder(wo, req.user.username);
+        updated += r.updated||0; added += r.added||0; synced++;
+        if (r.allDone) completed++;
+        if (r.moved) moved++;
+      } catch(err) { failed++; console.warn('sync-all one failed', wo.id, err.message); }
     }
-    res.json({ success:true, synced, updated, added, completed });
+    res.json({ success:true, synced, updated, added, completed, moved, failed });
   } catch(e) { console.error('wo sync-all', e); res.status(500).json({ error:'Sync failed' }); }
 });
 
